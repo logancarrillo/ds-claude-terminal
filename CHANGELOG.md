@@ -1,8 +1,8 @@
 # Changelog
 
-## 1.2 (unreleased)
+## 1.2 (2026-10-24)
 
-### Talk to Claude with your voice
+### Speech to text
 - Hold **R** in the composer, speak, and let go: your words appear as text.
 - Nothing is sent until you read it and press **A**.
 - **SETTINGS → LINK → MIC → LATCH**: press **L** while holding **R** to keep
@@ -10,36 +10,32 @@
 - Transcribed on your own computer by a local Whisper. Cloud is used only if
   you turn it on.
 
-### A controls guide on the DS
+### Controls guide
 - Hold **SELECT**, then press **START** (or **QUICK → CONTROLS**).
 - A drawing of your console lights each button as you press it.
 - A box on the top screen says what the button or combo does.
 - Labels follow your own button settings. Nothing you press is sent.
 
-### Type in the composer without the stylus
+### Keyboard focus in the composer
 - Hold **L**, then press **R**: the d-pad walks the keyboard.
 - **A** types the lit key, **START** sends, **X** leaves focus.
 
-### Four languages
+### Interface languages
 - The DS's menus in English, Spanish, Chinese or Japanese:
   **SETTINGS → SCREEN → LANGUAGE**.
 - Add your own with `dsterm lang --template`.
 
-### Your own quick commands
+### Saved quick commands
 - **QUICK → COMMANDS → + ADD** saves a command on the card.
 - Pick it later to load it into the composer; **A** sends it.
 
-### Simpler settings
+### Settings tabs
 - Five tabs instead of three: SESSION, SOUND, SCREEN, LINK and BUTTONS.
 - Your saved settings carry over.
 
-### A fuller PROJECT page
+### PROJECT page
 - **WATCH**: a focus timer (`dsterm timer 25`) and your own rows.
 - **HEALTH**: the computer's load and free disk. **LOG**: recent commits.
-
-### Fixes
-- Pressing **A** with nothing typed no longer sounds like a prompt was sent.
-- A settings file with an unknown value now keeps every other setting.
 
 ### Details
 
@@ -73,6 +69,32 @@ GitHub every 30 seconds.
 
 **Settings.** CUSTOMIZE's rows moved to SOUND, SCREEN and LINK. The file
 stores values, not tabs, so nothing needs resetting.
+
+### Bug fixes
+
+Fixed from 1.0.1:
+- Pressing **A** with nothing typed played the send and thinking sounds as if a
+  prompt had gone out.
+- One unknown value in the DS's settings file reset every setting; now only
+  that setting goes back to its default.
+
+Caught before release (never in a published version):
+- Voice could go to a cloud service when an API key happened to be set, with
+  no opt-in. Cloud now needs `--stt-cloud`.
+- A DS on 1.0.x would have lost its PROJECT page to the larger 1.2 page.
+- The DS accepted a transcript it had not asked for.
+- Pressing **X** while recording could drop the connection.
+- Opening snippets while recording left the microphone on.
+- One failed transcription could leave voice "busy" for several minutes.
+- Chinese and Japanese characters were drawn with their tops and bottoms cut
+  off, and two composer headers overlapped in those languages.
+- Speaking with the DS in Chinese or Japanese produced no text; it now listens
+  for English.
+- A quick command that could not be saved lost what you had typed, and a full
+  or removed card could lose the whole saved list.
+- A damaged `.dsterm/timer.json` froze the PROJECT page, and `dsterm timer`
+  could crash.
+- A long label in a custom language pack could push buttons off the screen.
 
 ## 1.0.1 (2026-10-17)
 
