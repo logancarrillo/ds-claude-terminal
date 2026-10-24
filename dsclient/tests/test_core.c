@@ -5015,7 +5015,9 @@ static void test_layout_widths_every_language(void)
               l, label_cols);
         for (int i = 0; i < (int)QUICK_ROW_COUNT; i++) {
             const quick_row_t r = (quick_row_t)i;
-            char lbl[48], note[96], row[160];
+            // Room for every part at its largest (48 + 16 + 96 + separators):
+            // gcc's -Wformat-truncation proves the sum, not the typical row.
+            char lbl[48], note[96], row[176];
             (void)lang_pad_cols(quick_row_label(r), label_cols, label_cols,
                                 lbl, sizeof(lbl));
             if (r == QUICK_ROW_MODE) {

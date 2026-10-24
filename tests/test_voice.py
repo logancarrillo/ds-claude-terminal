@@ -503,7 +503,9 @@ class TestLocalBackends:
         log = tmp_path / "argv"
         cmd = _script(tmp_path, "stt",
                       f'printf "%s\\n" "$@" > "{log}"\n'
-                      f'stat -f %Lp "$1" >> "{log}" 2>/dev/null || stat -c %a "$1" >> "{log}"\n'
+                      # GNU stat first: on Linux `stat -f` is filesystem
+                      # status and succeeds, so the BSD form cannot lead.
+                      f'stat -c %a "$1" >> "{log}" 2>/dev/null || stat -f %Lp "$1" >> "{log}"\n'
                       'echo "  heard you  "\n')
         backend = dsvoice.Backend("cmd", "stt", cmd)
         t = dsvoice.Transcriber(backend, {}, timeout=10)
