@@ -54,6 +54,8 @@ static int type_is_known(uint8_t t)
     case MSG_PHOTO_END: case MSG_PHOTO_DISCARD:
     case MSG_CAMERA_READY: case MSG_CAMERA_ACK: case MSG_PHOTO_SAVED:
     case MSG_SUBSCREEN: case MSG_MIRROR: case MSG_TOUCH: case MSG_ANSWER:
+    case MSG_VOICE_START: case MSG_VOICE_CHUNK: case MSG_VOICE_END:
+    case MSG_MIC_READY: case MSG_VOICE_ACK: case MSG_VOICE_TEXT:
         return 1;
     default:
         return 0;
@@ -249,11 +251,15 @@ proto_result_t proto_apply_sessions(session_chunk_t *chunk,
     return PROTO_OK;
 }
 
-// One printable-ASCII field, clamped to the destination.  Both of the page's
+// One displayable field, clamped to the destination.  Both of the page's
 // strings come off the wire and both end up on a screen, so both get the same
 // treatment the session name gets: a byte that cannot be drawn becomes '?'
 // rather than a reason to tear down a live terminal, and a field longer than
-// the destination is truncated rather than trusted.
+// the destination is truncated rather than trusted.  Printable ASCII and the
+// 0x80..0xBF glyph block (font6x8_ext: blocks, sparklines) pass, because the
+// card announced `project64`.  The glyph bytes are for the screen only -- on
+// a PTY they are C1 controls -- so a row is display text, and anything that
+// would type one checks project_action_keyable() first.
 static void project_text_copy(char *out, size_t cap, const uint8_t *src,
                               size_t len)
 {
@@ -262,7 +268,7 @@ static void project_text_copy(char *out, size_t cap, const uint8_t *src,
     if (n > cap - 1) n = cap - 1;
     for (size_t i = 0; i < n; i++) {
         const uint8_t b = src[i];
-        out[i] = (b >= 0x20 && b <= 0x7E) ? (char)b : '?';
+        out[i] = ((b >= 0x20 && b <= 0x7E) || (b >= 0x80 && b < 0xC0)) ? (char)b : '?';
     }
     out[n] = '\0';
 }
@@ -801,4 +807,110 @@ size_t proto_encode_remote_pick(uint8_t *out, uint8_t index, uint8_t action,
     const uint8_t body[4] = { index, action, (uint8_t)(check >> 8),
                               (uint8_t)check };
     return proto_encode(out, MSG_REMOTE_PICK, body, sizeof(body));
+}
+
+// ----------------------------------------------------------------- voice ---
+
+int proto_voice_type(uint8_t type)
+{
+    return type == MSG_VOICE_START || type == MSG_VOICE_CHUNK ||
+           type == MSG_VOICE_END;
+}
+
+static int valid_voice_lang_char(char c)
+{
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_';
+}
+
+size_t proto_encode_voice_start(uint8_t *out, uint8_t format, const char *lang)
+{
+    if (!out || format != VOICE_FORMAT_IMA_ADPCM_8K) return 0;
+    const size_t n = lang ? strlen(lang) : 0;
+    if (n > VOICE_LANG_MAX) return 0;
+    uint8_t body[2 + VOICE_LANG_MAX];
+    body[0] = format;
+    body[1] = (uint8_t)n;
+    for (size_t i = 0; i < n; i++) {
+        if (!valid_voice_lang_char(lang[i])) return 0;
+        body[2 + i] = (uint8_t)lang[i];
+    }
+    return proto_encode(out, MSG_VOICE_START, body, (uint16_t)(2 + n));
+}
+
+size_t proto_encode_voice_chunk(uint8_t *out, uint32_t offset,
+                                const uint8_t *data, uint16_t len)
+{
+    if (!out || !data || len == 0 || len > VOICE_CHUNK_MAX) return 0;
+    if (offset >= VOICE_BYTES_MAX || offset + len > VOICE_BYTES_MAX) return 0;
+    // Static: 484 bytes is past what the ARM9's ~16 KB DTCM stack should
+    // carry in one frame, with no MMU to catch an overflow.  Only the main
+    // loop encodes chunks (mic.c, never an interrupt), so nothing re-enters.
+    static uint8_t body[4 + VOICE_CHUNK_MAX];
+    body[0] = (uint8_t)(offset >> 24);
+    body[1] = (uint8_t)(offset >> 16);
+    body[2] = (uint8_t)(offset >> 8);
+    body[3] = (uint8_t)offset;
+    memcpy(body + 4, data, len);
+    return proto_encode(out, MSG_VOICE_CHUNK, body, (uint16_t)(4 + len));
+}
+
+size_t proto_encode_voice_end(uint8_t *out, uint32_t total, uint32_t crc)
+{
+    if (!out || total == 0 || total > VOICE_BYTES_MAX) return 0;
+    const uint8_t body[8] = {
+        (uint8_t)(total >> 24), (uint8_t)(total >> 16),
+        (uint8_t)(total >> 8),  (uint8_t)total,
+        (uint8_t)(crc >> 24),   (uint8_t)(crc >> 16),
+        (uint8_t)(crc >> 8),    (uint8_t)crc,
+    };
+    return proto_encode(out, MSG_VOICE_END, body, sizeof(body));
+}
+
+proto_result_t proto_decode_mic_ready(int *can_transcribe_out,
+                                      const uint8_t *payload, uint16_t len)
+{
+    if (!can_transcribe_out || !payload || len != 1) return PROTO_ERR_PAYLOAD;
+    if (payload[0] & ~PROTO_MIC_CAN_TRANSCRIBE) return PROTO_ERR_PAYLOAD;
+    *can_transcribe_out = (payload[0] & PROTO_MIC_CAN_TRANSCRIBE) ? 1 : 0;
+    return PROTO_OK;
+}
+
+proto_result_t proto_decode_voice_ack(uint32_t *acked_out,
+                                      const uint8_t *payload, uint16_t len)
+{
+    if (!acked_out || !payload || len != 4) return PROTO_ERR_PAYLOAD;
+    const uint32_t v = ((uint32_t)payload[0] << 24) |
+                       ((uint32_t)payload[1] << 16) |
+                       ((uint32_t)payload[2] << 8) |
+                       (uint32_t)payload[3];
+    if (v > VOICE_BYTES_MAX) return PROTO_ERR_PAYLOAD;
+    *acked_out = v;
+    return PROTO_OK;
+}
+
+proto_result_t proto_decode_voice_text(voice_text_t *out,
+                                       const uint8_t *payload, uint16_t len)
+{
+    if (!out || !payload || len < 3) return PROTO_ERR_PAYLOAD;
+    memset(out, 0, sizeof(*out));
+    const uint8_t status = payload[0];
+    const uint16_t text_len = (uint16_t)((payload[1] << 8) | payload[2]);
+    if (status > VOICE_STATUS_MAX) return PROTO_ERR_PAYLOAD;
+    if ((size_t)3 + text_len != (size_t)len) return PROTO_ERR_PAYLOAD;
+    if (status != VOICE_STATUS_OK) {
+        if (text_len != 0) return PROTO_ERR_PAYLOAD;
+        out->status = status;
+        return PROTO_OK;
+    }
+    if (text_len < 1 || text_len > VOICE_TEXT_MAX) return PROTO_ERR_PAYLOAD;
+    for (size_t i = 0; i < text_len; i++) {
+        const uint8_t b = payload[3 + i];
+        if (!((b >= 0x20 && b <= 0x7E) || b == '\n')) return PROTO_ERR_PAYLOAD;
+    }
+    memcpy(out->text, payload + 3, text_len);
+    out->text[text_len] = '\0';
+    out->status = status;
+    out->text_len = text_len;
+    return PROTO_OK;
 }

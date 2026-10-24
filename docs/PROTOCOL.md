@@ -119,6 +119,9 @@ card announced, or proof that the server understands it (see
 | 0x1F | `PHOTO_DISCARD` | `camera`, and a `CAMERA_READY` received | u16 id the server issued in `PHOTO_SAVED` |
 | 0x20 | `SUBSCREEN` | `mirror`, and a `MIRROR` saying a view is watching | the bottom screen as text: u8 cols, u8 rows, u8 flags, then 42x24 cells of 6 bytes (6,051 bytes) |
 | 0x21 | `ANSWER` | `ask`, and a `STATE` carrying an ask id received | u32 ask id, then 1 to 64 key bytes: [Answers](#answers) |
+| 0x22 | `VOICE_START` | `mic`, and a `MIC_READY` received | u8 format (1: IMA ADPCM, 8 kHz), u8 language length, language hint: [Voice](#voice) |
+| 0x23 | `VOICE_CHUNK` | `mic`, and a `MIC_READY` received | u32 offset, 1..480 bytes of ADPCM |
+| 0x24 | `VOICE_END` | `mic`, and a `MIC_READY` received | u32 total, u32 CRC-32 |
 
 Before authentication the server accepts only `HELLO`, `AUTH`, `PAIR_HELLO`,
 `PAIR_CONFIRM` and `PAIR_ACCEPT`; anything else drops the connection, so an
@@ -141,7 +144,7 @@ unauthenticated peer can never reach the PTY.
 | 0x97 | `SESSIONS` | none (see below) | one entry of the session list |
 | 0x98 | `SNIPPETS` | `snippets` | one snippet of a pushed set |
 | 0x99 | `EXTENSION` | the extension's own token | opaque; the terminal never reads it |
-| 0x9A | `PROJECT` | `project` | one row of the PROJECT page |
+| 0x9A | `PROJECT` | `project` (64 rows and glyph bytes only with `project64`) | one row of the PROJECT page |
 | 0x9B | `CLIP` | `clip`, and the server started with `--clip` | one chunk of the desktop clipboard |
 | 0x9C | `PAIR_REPLY` | answers `PAIR_HELLO` | X25519 public key (32), commitment to the server's nonce (32) |
 | 0x9D | `PAIR_OK` | answers `PAIR_CONFIRM` | the server's 16-byte nonce, which must open the commitment |
@@ -156,6 +159,9 @@ unauthenticated peer can never reach the PTY.
 | 0xA6 | `PHOTO_SAVED` | answers `PHOTO_END` | u8 status, u16 id, u8 path length, path (status 0 only) |
 | 0xA7 | `MIRROR` | `mirror` | u8: 1 a `dsterm view` is watching, 0 none is |
 | 0xA8 | `TOUCH` | `mirror`, while a view is watching | u8 x (0-255), u8 y (0-191): a tap on the bottom screen |
+| 0xA9 | `MIC_READY` | `mic`, unless the server runs `--no-mic` | u8 flags: bit 0, speech-to-text is available |
+| 0xAA | `VOICE_ACK` | a `VOICE_CHUNK` received | u32 bytes of this utterance the server holds |
+| 0xAB | `VOICE_TEXT` | answers `VOICE_END` | u8 status, u16 length, text (status 0 only: 1-480 printable ASCII) |
 | 0xFF | `ERROR` | | ASCII reason, for example `busy` or `no such session` |
 
 `tests/test_protocol.py` pins this list. Each type in it carries a written
@@ -186,6 +192,8 @@ not fit).
 | `commands` | Send `COMMANDS` after `AUTH_OK` and whenever the list changes |
 | `camera` | The card has a camera (a DSi): send `CAMERA_READY`, accept the camera and photo messages, and answer their ACKs |
 | `mirror` | Send `MIRROR` after `AUTH_OK` and whenever a view comes or goes; accept `SUBSCREEN` |
+| `mic` | The card has a microphone and knows the voice types: send `MIC_READY` after `AUTH_OK` (not under `--no-mic`), accept `VOICE_START`, `VOICE_CHUNK` and `VOICE_END`, and answer them ([Voice](#voice)) |
+| `project64` | The card takes `PROJECT` snapshots of up to 64 rows with the DS glyph bytes 0x80-0xBF in their text. Without it (a 1.0.x card refuses more than 48 rows and draws those bytes as `?`) the server sends at most 48 rows -- NOW, DIFF and DO first, then WATCH, HEALTH and LOG while they fit -- folded to printable ASCII |
 | `grid=COLSxROWS` | The card's build geometry, so a server set up for another size can refuse the card by name rather than stream cells into the wrong shape |
 | `id=<8 hex>` | This card's device id, lowercase. Selects the per-device key `AUTH` is checked against. Grants nothing |
 
@@ -210,6 +218,7 @@ server's message is the proof:
 | `REMOTE_OPEN`, `REMOTE_PICK` | a `REMOTE` frame (the server sends an empty "not asked yet" set right after `AUTH_OK` to a card that announced `remote`) |
 | `CAMERA`, `CAMERA_FRAME`, `PHOTO_CHUNK`, `PHOTO_END`, `PHOTO_DISCARD` | `CAMERA_READY` (sent right after `AUTH_OK` to a card that announced `camera`) |
 | `SUBSCREEN` | a `MIRROR` whose byte is 1 (sent to a card that announced `mirror` when a view is open) |
+| `VOICE_START`, `VOICE_CHUNK`, `VOICE_END` | `MIC_READY` (sent right after `AUTH_OK` to a card that announced `mic`, unless the server runs `--no-mic`); and a card records only when its bit 0 says speech-to-text is available |
 
 The server applies the same rule in the other direction for one message: it
 sends `VIEW_POS` only to a client that has sent `VIEW` (or picked a session),
@@ -233,7 +242,8 @@ card                                         server
   | <--- AUTH_OK "seal3" -------------------- |  or AUTH_FAIL, then close
   |      (every frame encrypted and sealed from here, both ways)
   | <--- MODE, SNIPPETS*, FRAME_DIFF*, CURSOR, SESSIONS*, CLIP*,
-  |      REMOTE (empty), STATE, COMMANDS, MIRROR, CAMERA_READY  |  each only if
+  |      REMOTE (empty), STATE, COMMANDS, MIRROR, CAMERA_READY,  |  each only if
+  |      MIC_READY                                |
   |                                              |  negotiated; order not fixed
   | <==> KEY, VIEW, PING / screen updates ==> |
 ```
@@ -253,7 +263,7 @@ card                                         server
 - After `AUTH_OK` the server starts, only where negotiated: `MODE` (even when
   the flag is clear), the pushed snippet set, a full repaint, a forced
   `SESSIONS` snapshot, the clipboard, an empty `REMOTE` set with status 0, the
-  current `STATE`, `COMMANDS`, `MIRROR` and `CAMERA_READY`. `MODE`, the snippet
+  current `STATE`, `COMMANDS`, `MIRROR`, `CAMERA_READY` and `MIC_READY`. `MODE`, the snippet
   set and the other small messages go to the socket at once; the repaint and
   the `SESSIONS`, clipboard and `REMOTE` lists are released through the paced
   outbox, four messages a tick, so they arrive later and interleaved. A card
@@ -306,7 +316,7 @@ set has arrived and validated.
 |---|---|---|---|
 | `SESSIONS` | count, index, flags, idle seconds (u16), name length, name | 1 byte: `0` | 8 entries, names 1-24 printable ASCII. Flags: 0x01 running, 0x02 active, 0x04 new output |
 | `SNIPPETS` | index, total, label length, label, body length (u16), body | none; nothing is sent | 8 snippets, label 1-15, body up to 255 |
-| `PROJECT` | count, index, tab, colour, label length, value length, label, value | 1 byte: `0` | 48 rows, tab 0-5 (NOW, DIFF, DO, WATCH, HEALTH, LOG), colour 0-15, label 1-12, value up to 40 |
+| `PROJECT` | count, index, tab, colour, label length, value length, label, value | 1 byte: `0` | 64 rows to a `project64` card, 48 otherwise; tab 0-5 (NOW, DIFF, DO, WATCH, HEALTH, LOG), colour 0-15, label 1-12, value up to 40; printable ASCII, plus the glyph bytes 0x80-0xBF (`dsterm/extmap.py`) to a `project64` card only |
 | `CLIP` | count, index, seq, flags, total (u32), length, bytes | 2 bytes: `0`, flags | 6 chunks of up to 192 bytes, 1024 bytes of text, printable ASCII and newline only. Flags: 0x01 truncated, 0x02 transliterated, 0x04 withheld (empty only) |
 | `REMOTE` | count, index, kind, state, flags, age (u16), name length, name, detail length, detail | 2 bytes: `0`, status | See [REMOTE.md](REMOTE.md) |
 
@@ -463,6 +473,56 @@ one picture per connection every three seconds, and saves one at a time.
 A camera message from a card that never negotiated it, or a preview while
 the camera is off, drops the connection.
 
+### Voice
+
+Push-to-Talk: the card records while the person holds **R** in the composer,
+and the transcript comes back into the composer. The messages cross only
+where a `mic` token was announced and `MIC_READY` answered on this
+connection. The card sends samples and a language hint; the server alone
+decides what transcribes them, and where.
+
+- **`MIC_READY`**: u8 flags; bit 0 means this server can transcribe. Clear
+  when no local speech-to-text is installed and the cloud was not opted in
+  (below), so the card says so instead of recording. Its receipt is the
+  proof that lets the voice types be sent at all.
+- **`VOICE_START`**: u8 format, which must be 1 (4-bit IMA ADPCM, 8,000 Hz
+  mono, low nibble first), u8 length and a language hint of at most seven of
+  `[A-Za-z0-9_-]`. The server keeps only two or three letters of it (`en`,
+  `es`, `pt` from `pt-BR`) and drops anything else, in which case the
+  language is detected. It also resets the utterance being assembled.
+- **`VOICE_CHUNK`**: u32 offset, then 1 to 480 bytes of ADPCM. Offsets must
+  be contiguous from 0 and the utterance stays under 60,000 bytes (15
+  seconds); a gap or an overrun drops the connection. Offset 0 restarts.
+- **`VOICE_ACK`**: u32, the bytes of this utterance the server holds -- the
+  credit the card's upload window slides on.
+- **`VOICE_END`**: u32 total, u32 CRC-32 (the camera's: reflected
+  0xEDB88320, initial 0, final inversion). A total that does not match what
+  arrived drops the connection; a bad CRC answers `VOICE_TEXT` INTEGRITY.
+- **`VOICE_TEXT`**: u8 status, u16 length, then on status 0 only 1 to 480
+  bytes of printable ASCII. Statuses: 0 OK, 1 busy (this card's last
+  utterance is still being transcribed, or another card's is), 2 the audio
+  arrived damaged, 3 no transcript (no speech-to-text, or it failed or ran
+  out of time -- the server's log says which), 4 nothing was heard. The text
+  lands in the composer, and nothing is sent until the person presses **A**.
+
+One utterance per card is transcribed at a time, and every transcription has
+a deadline: `DSTERM_STT_TIMEOUT` (15 s by default), at which a backend
+process is killed, and two seconds after it the server answers the card 3
+whatever the backend is doing -- inside the 20 s the card itself waits. A
+Python library backend loading its model (on a first run, perhaps
+downloading it) is allowed five minutes before it is killed; the card is
+still answered at the usual deadline, and is answered 1, busy, until the
+load ends. A transcript that arrives after the card was answered, or after it
+left, is dropped rather than delivered.
+
+Where the audio goes is fixed when the server starts, and printed: a local
+backend (`DSTERM_STT_CMD`, then `mlx-whisper`, `faster-whisper`,
+`openai-whisper`, then `whisper-cli`), or -- only with `dsterm serve
+--stt-cloud` or `DSTERM_STT_CLOUD=1`, and only when nothing local is
+installed -- OpenAI, Groq or `DSTERM_STT_URL` over https. An API key in the
+environment alone never sends anything, and a failed local backend is never
+followed by an upload.
+
 ### The view: SUBSCREEN, MIRROR and TOUCH
 
 `dsterm view` shows the card's bottom screen on the computer. The card keeps
@@ -609,8 +669,8 @@ reflashed to fix. Several mechanisms hold the two halves together:
 
 | Mechanism | What it pins |
 |---|---|
-| `tools/crosscheck.py` | The C suite prints `INTEROP <name> <hex>` lines; the script recomputes each with the server's own code and fails on any difference. Vectors: the AUTH HMAC, a framed message, a `PROJECT` row, `CLIP` chunks (including both empty forms), the whole pairing exchange (both public keys, the device key, both MACs), the `HELLO` payload with and without `camera`, the discovery
-probe, and the camera set — `CAMERA`, a `CAMERA_FRAME`, a `PHOTO_CHUNK`,
+| `tools/crosscheck.py` | The C suite prints `INTEROP <name> <hex>` lines; the script recomputes each with the server's own code and fails on any difference. Vectors: the AUTH HMAC, a framed message, a `PROJECT` row, `CLIP` chunks (including both empty forms), the whole pairing exchange (both public keys, the device key, both MACs), the `HELLO` payload with and without `camera` (both carrying `mic` and `project64`), the discovery
+probe, the voice set -- IMA ADPCM encoded and decoded on both sides, and `VOICE_START`, `VOICE_CHUNK` and `VOICE_END` as the card sends them -- and the camera set — `CAMERA`, a `CAMERA_FRAME`, a `PHOTO_CHUNK`,
 `PHOTO_END`, `PHOTO_DISCARD`, the 128x96 grey preview, the 96x72 colour
 preview, the YUYV conversion, the CRC-32, and both 4:2:0 packs as SHA-256;
 and a `SUBSCREEN`'s head and tail |

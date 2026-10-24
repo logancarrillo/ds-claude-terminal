@@ -1356,6 +1356,8 @@ class TestServeOption:
         made = {}
 
         class FakeServer:
+            voice_where = "off (a test's server)"
+
             def __init__(self, command, key, **kwargs):
                 made.update(kwargs, command=command)
 
@@ -1367,6 +1369,9 @@ class TestServeOption:
 
             def __exit__(self, *exc):
                 return False
+
+            def warm_voice(self):
+                pass
 
             def serve_forever(self):
                 pass

@@ -533,3 +533,141 @@ def test_card_sounds_set_a_replaced_cues_old_takes_aside(tmp_path, monkeypatch):
     assert len(old) == 2 and "done-2.wav" in old
     moved = next(p for p in (sounds_dir / "old").iterdir() if p.name != "done-2.wav")
     assert moved.read_bytes() == before
+
+
+# -- dsterm timer --------------------------------------------------------------
+
+@pytest.fixture
+def timer_dir(tmp_path, monkeypatch):
+    """A working directory outside any repository: the timer lives there."""
+    d = tmp_path / "work"
+    d.mkdir()
+    monkeypatch.chdir(d)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(tmp_path))
+    return d
+
+
+class TestTimer:
+    def test_start_status_and_stop(self, timer_dir, capsys):
+        import json
+        from dsterm import cli
+
+        assert cli.cmd_timer(["25", "deep", "work"]) == 0
+        data = json.loads((timer_dir / ".dsterm" / "timer.json").read_text())
+        assert data["label"] == "deep work"
+        assert (timer_dir / ".dsterm" / ".gitignore").is_file()
+        capsys.readouterr()
+        assert cli.cmd_timer(["status"]) == 0
+        out = capsys.readouterr().out
+        assert out.startswith("timer: deep work -- ")
+        assert "remaining" in out and ("24m" in out or "25m 00s" in out)
+        assert cli.cmd_timer(["stop"]) == 0
+        assert not (timer_dir / ".dsterm" / "timer.json").exists()
+        cli.cmd_timer([])
+        assert "timer: off" in capsys.readouterr().out
+
+    def test_a_finished_timer_says_done(self, timer_dir, capsys):
+        import json
+        from dsterm import cli
+
+        (timer_dir / ".dsterm").mkdir()
+        (timer_dir / ".dsterm" / "timer.json").write_text(json.dumps(
+            {"label": "tea", "end_ts": time.time() - 0.2}))
+        assert cli.cmd_timer(["status"]) == 0
+        assert capsys.readouterr().out == "timer: tea -- done\n"
+
+    @pytest.mark.parametrize("body", [
+        "[]", "null", '"x"', '{"end_ts": 1e400}', '{"end_ts": NaN}',
+        '{"end_ts": "soon"}', '{"end_ts": [1]}', "{torn",
+    ])
+    def test_status_of_a_bad_file_is_off_not_a_traceback(
+            self, timer_dir, capsys, body):
+        from dsterm import cli
+
+        (timer_dir / ".dsterm").mkdir()
+        (timer_dir / ".dsterm" / "timer.json").write_text(body)
+        assert cli.cmd_timer(["status"]) == 0
+        assert capsys.readouterr().out == "timer: off\n"
+
+    @pytest.mark.parametrize("argv", [["soon"], ["0"], ["241"], ["nan"]])
+    def test_a_bad_duration_is_refused(self, timer_dir, argv):
+        from dsterm import cli
+
+        with pytest.raises(SystemExit) as exc:
+            cli.cmd_timer(argv)
+        assert exc.value.code == 1
+        assert not (timer_dir / ".dsterm" / "timer.json").exists()
+
+
+# -- dsterm lang and card --lang ------------------------------------------------
+
+class TestLang:
+    def test_an_unknown_argument_is_refused(self, capsys):
+        from dsterm import cli
+
+        with pytest.raises(SystemExit):
+            cli.cmd_lang(["--tempate"])
+        assert "unknown argument '--tempate'" in capsys.readouterr().err
+
+    def test_the_template_fits_and_names_only_real_keys(self, capsys):
+        import re
+        from dsterm import cli
+
+        assert cli.cmd_lang(["--template"]) == 0
+        text = capsys.readouterr().out
+        assert len(text.encode("utf-8")) <= cli.LANG_FILE_MAX
+        assert "son, modèle" in text and "English" in text
+        keys = [line.split("=", 1)[0].strip() for line in text.splitlines()
+                if "=" in line and not line.startswith("#")]
+        assert len(keys) == len(set(keys))
+        lang_c = REPO / "dsclient" / "source" / "lang.c"
+        if not lang_c.is_file():
+            pytest.skip("no ROM source in this tree")
+        table = lang_c.read_text(encoding="utf-8").split("KEY_NAMES", 1)[1]
+        names = set(re.findall(r'\]\s*=\s*"([a-z0-9_.]+)"', table.split("};", 1)[0]))
+        assert set(keys) - {"code", "label", "name"} <= names
+        for key in ("compose.focus.head", "compose.focus.keys",
+                    "compose.mic.latch", "guide.title"):
+            assert key in keys
+
+    def _card(self, tmp_path, monkeypatch):
+        from dsterm import cli
+
+        monkeypatch.setattr(cli, "checkout", lambda: None)
+        monkeypatch.setattr(cli, "extensions", lambda: [])
+        card = tmp_path / "card"
+        card.mkdir()
+        (card / "dsterm.nds").write_bytes(b"the app already there")
+        return card
+
+    def test_a_file_over_8_kb_is_refused_with_the_reason(
+            self, tmp_path, monkeypatch, capsys):
+        from dsterm import cli
+
+        card = self._card(tmp_path, monkeypatch)
+        big = tmp_path / "fr.lang"
+        big.write_bytes(b"#" * (cli.LANG_FILE_MAX + 1))
+        with pytest.raises(SystemExit):
+            cli.cmd_card([str(card), "--lang", str(big), "--no-eject"])
+        assert "reads at most 8 KB" in capsys.readouterr().err
+        assert not (card / "dsterm" / "lang").exists()
+
+    def test_more_languages_than_the_ds_loads_is_warned(
+            self, tmp_path, monkeypatch, capsys):
+        from dsterm import cli
+
+        card = self._card(tmp_path, monkeypatch)
+        files = []
+        for code in ("fr", "de", "it"):
+            f = tmp_path / f"{code}.lang"
+            f.write_text(f"code = {code}\n")
+            files += ["--lang", str(f)]
+        assert cli.cmd_card([str(card), *files, "--no-eject"]) == 0
+        err = capsys.readouterr().err
+        assert f"loads at most {cli.LANG_CUSTOM_MAX}" in err
+        capsys.readouterr()
+        card2 = tmp_path / "card2"
+        card2.mkdir()
+        (card2 / "dsterm.nds").write_bytes(b"x")
+        assert cli.cmd_card([str(card2), *files[:2], "--no-eject"]) == 0
+        assert "loads at most" not in capsys.readouterr().err

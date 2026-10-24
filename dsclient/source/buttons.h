@@ -59,7 +59,9 @@ button_t button_for(const button_map_t *map, button_action_t action);
 
 const char *button_name(button_t button);               // "A", "START"
 const char *button_action_label(button_action_t action); // "ENT", "STOP" (chips)
-const char *button_action_word(button_action_t action);  // "enter", "stop" (hints, file)
+const char *button_action_word(button_action_t action);  // "enter", "stop" (file)
+// The same word in the language on screen (lang.h), for hints and legends.
+const char *button_action_hint(button_action_t action);
 // The bytes the action sends, as a keyboard would.  Never NULL.
 const char *button_action_bytes(button_action_t action, size_t *len);
 

@@ -126,6 +126,13 @@ class MsgType(IntEnum):
     # for one permission prompt can never answer the next. Like KEY it is key
     # bytes and nothing else: it names no command and no file.
     ANSWER = 0x21
+    # Push-to-Talk microphone (dsterm/voice.py).  Audio samples (4-bit IMA
+    # ADPCM at 8 kHz) and a short ISO language code hint; none names a file, a
+    # path or a command.  Gated like CAMERA: the card announces "mic" in HELLO
+    # and sends none of these until MIC_READY has arrived on this connection.
+    VOICE_START = 0x22      # u8 format (1=IMA ADPCM 8kHz), u8 lang_len, lang
+    VOICE_CHUNK = 0x23      # u32be offset, 1..480 ADPCM bytes
+    VOICE_END = 0x24        # u32be total_bytes, u32be CRC-32
 
     # server -> client
     NONCE = 0x81
@@ -235,6 +242,12 @@ class MsgType(IntEnum):
     # card acts on only with its VIEW TAPS setting on.
     MIRROR = 0xA7           # u8 flags: bit0 a view is watching
     TOUCH = 0xA8            # u8 x (0..255), u8 y (0..191)
+    # Sent only to a card that announced "mic": the capability proof right
+    # after AUTH_OK, the credit window updates, and the transcribed text that
+    # lands in the card's local composer for a second deliberate press of A.
+    MIC_READY = 0xA9        # u8 flags: bit0 speech-to-text is available
+    VOICE_ACK = 0xAA        # u32be received ADPCM bytes
+    VOICE_TEXT = 0xAB       # u8 status, u16be len, text (printable ASCII/LF)
     ERROR = 0xFF
 
 
@@ -810,6 +823,14 @@ FEATURE_MIRROR = "mirror"
 # STATE carries the open question's id and the card ties its Enter to it
 # (ANSWER). See docs/PROTOCOL.md, "Answers".
 FEATURE_ASK = "ask"
+# The card has a microphone and knows the voice types: send MIC_READY after
+# AUTH_OK (unless --no-mic), and only then may it send VOICE_*.
+FEATURE_MIC = "mic"
+# The card takes PROJECT snapshots of up to PROJECT_ROWS_MAX (64) rows and the
+# DS glyph bytes 0x80-0xBF in their text. A 1.0.x card refuses a count above
+# PROJECT_ROWS_MAX_V1 and draws those bytes as '?', so without this token the
+# server sends it at most 48 rows of printable ASCII (project.encode).
+FEATURE_PROJECT64 = "project64"
 
 
 def encode_hello(features: tuple[str, ...] = ()) -> bytes:
@@ -996,9 +1017,43 @@ PROJECT_TAB_WATCH = 3
 PROJECT_TAB_HEALTH = 4
 PROJECT_TAB_LOG = 5
 PROJECT_TAB_COUNT = 6
-PROJECT_ROWS_MAX = 48
+PROJECT_ROWS_MAX = 64
+# What a card without "project64" (1.0.x) accepts. See FEATURE_PROJECT64.
+PROJECT_ROWS_MAX_V1 = 48
 PROJECT_LABEL_MAX = 12
 PROJECT_VALUE_MAX = 40
+
+
+def _encode_project_str(text: str, limit: int, glyphs: bool = True) -> bytes:
+    """Printable ASCII, plus -- for a "project64" card only -- the DS glyphs
+    of extmap.TO_WIRE as their wire bytes. Anything else is refused, not
+    replaced: what to show instead is project.py's decision, made before."""
+    out = bytearray()
+    for ch in text:
+        code = ord(ch)
+        if 0x20 <= code <= 0x7E:
+            out.append(code)
+        elif glyphs and code in TO_WIRE:
+            out.append(TO_WIRE[code])
+        elif glyphs:
+            raise ProtocolError("project text is not ASCII or extended DS glyph")
+        else:
+            raise ProtocolError("project text is not printable ASCII")
+        if len(out) >= limit:
+            break
+    return bytes(out)
+
+
+def _decode_project_bytes(raw: bytes) -> str:
+    chars: list[str] = []
+    for b in raw:
+        if 0x20 <= b <= 0x7E:
+            chars.append(chr(b))
+        elif b in FROM_WIRE:
+            chars.append(chr(FROM_WIRE[b]))
+        else:
+            raise ProtocolError("project text must be printable ASCII or extended DS glyph")
+    return "".join(chars)
 
 
 def encode_project_empty() -> bytes:
@@ -1012,27 +1067,24 @@ def encode_project_empty() -> bytes:
 
 
 def encode_project_row(index: int, count: int, tab: int, fg: int,
-                       label: str, value: str) -> bytes:
-    """One row: count, index, tab, fg, label_len, value_len, label, value."""
-    if not 1 <= count <= PROJECT_ROWS_MAX:
-        raise ProtocolError(f"count {count} outside 1..{PROJECT_ROWS_MAX}")
+                       label: str, value: str, project64: bool = True) -> bytes:
+    """One row: count, index, tab, fg, label_len, value_len, label, value.
+
+    ``project64=False`` is the 1.0.x card's contract: a count of at most
+    PROJECT_ROWS_MAX_V1 and printable ASCII only."""
+    rows_max = PROJECT_ROWS_MAX if project64 else PROJECT_ROWS_MAX_V1
+    if not 1 <= count <= rows_max:
+        raise ProtocolError(f"count {count} outside 1..{rows_max}")
     if not 0 <= index < count:
         raise ProtocolError(f"index {index} outside 0..{count - 1}")
     if not 0 <= tab < PROJECT_TAB_COUNT:
         raise ProtocolError(f"tab {tab} outside 0..{PROJECT_TAB_COUNT - 1}")
     if not 0 <= fg <= 15:
         raise ProtocolError(f"colour {fg} is not a palette index")
-    try:
-        lb = label.encode("ascii")
-        vb = value.encode("ascii")
-    except UnicodeEncodeError as exc:
-        raise ProtocolError("project text is not ASCII") from exc
-    lb = lb[:PROJECT_LABEL_MAX]
-    vb = vb[:PROJECT_VALUE_MAX]
+    lb = _encode_project_str(label, PROJECT_LABEL_MAX, project64)
+    vb = _encode_project_str(value, PROJECT_VALUE_MAX, project64)
     if not lb:
         raise ProtocolError("empty project label")
-    if any(b < 0x20 or b > 0x7E for b in lb + vb):
-        raise ProtocolError("project text must be printable ASCII")
     payload = (bytes((count, index, tab, fg, len(lb), len(vb))) + lb + vb)
     return encode(MsgType.PROJECT, payload)
 
@@ -1059,10 +1111,8 @@ def decode_project_row(payload: bytes) -> tuple[int, int, int, int, str, str]:
     if len(payload) != 6 + label_len + value_len:
         raise ProtocolError("declared lengths do not match the payload")
     body = payload[6:]
-    if any(b < 0x20 or b > 0x7E for b in body):
-        raise ProtocolError("project text must be printable ASCII")
-    label = body[:label_len].decode("ascii")
-    value = body[label_len:].decode("ascii")
+    label = _decode_project_bytes(body[:label_len])
+    value = _decode_project_bytes(body[label_len:])
     return count, index, tab, fg, label, value
 
 
@@ -2043,3 +2093,157 @@ def encode_touch(x: int, y: int) -> bytes:
     if not (0 <= x <= 255 and 0 <= y <= 191):
         raise ProtocolError(f"a tap at ({x}, {y}) is off the bottom screen")
     return encode(MsgType.TOUCH, bytes((x, y)))
+
+
+# -- Push-to-Talk microphone (voice.py) ---------------------------------------
+
+VOICE_FORMAT_IMA_ADPCM_8K = 1
+VOICE_SAMPLE_RATE = 8000
+VOICE_BYTES_MAX = 60000
+VOICE_CHUNK_MAX = 480
+VOICE_LANG_MAX = 7
+VOICE_TEXT_MAX = 480
+
+MIC_READY_CAN_TRANSCRIBE = 0x01
+
+VOICE_STATUS_OK = 0
+VOICE_STATUS_BUSY = 1
+VOICE_STATUS_INTEGRITY = 2
+VOICE_STATUS_NO_STT = 3
+VOICE_STATUS_EMPTY = 4
+_VOICE_STATUS_MAX = VOICE_STATUS_EMPTY
+
+# fullmatch, not match: "$" also matches before a final newline, so "en\n"
+# would pass a match against "^...$".
+_VOICE_LANG_RE = re.compile(r"[A-Za-z0-9_-]{0,7}")
+
+
+def encode_voice_start(fmt: int = VOICE_FORMAT_IMA_ADPCM_8K, lang: str = "en") -> bytes:
+    if fmt != VOICE_FORMAT_IMA_ADPCM_8K:
+        raise ProtocolError(f"voice format {fmt} is not 1")
+    if not isinstance(lang, str) or not _VOICE_LANG_RE.fullmatch(lang):
+        raise ProtocolError(f"invalid voice language {lang!r}")
+    lb = lang.encode("ascii")
+    return encode(MsgType.VOICE_START, bytes((fmt, len(lb))) + lb)
+
+
+def decode_voice_start(payload: bytes) -> tuple[int, str]:
+    if len(payload) < 2:
+        raise ProtocolError(f"voice start payload too short: {len(payload)}")
+    fmt, lang_len = payload[0], payload[1]
+    if fmt != VOICE_FORMAT_IMA_ADPCM_8K:
+        raise ProtocolError(f"voice format {fmt} is not 1")
+    if lang_len > VOICE_LANG_MAX or len(payload) != 2 + lang_len:
+        raise ProtocolError("voice start length mismatch")
+    try:
+        lang = payload[2:].decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("voice language must be ASCII") from exc
+    if not _VOICE_LANG_RE.fullmatch(lang):
+        raise ProtocolError(f"invalid voice language {lang!r}")
+    return fmt, lang.lower()
+
+
+def encode_voice_chunk(offset: int, data: bytes) -> bytes:
+    if not 0 <= offset < VOICE_BYTES_MAX:
+        raise ProtocolError(f"voice offset {offset} outside 0..{VOICE_BYTES_MAX - 1}")
+    if not 1 <= len(data) <= VOICE_CHUNK_MAX:
+        raise ProtocolError(f"voice chunk {len(data)} outside 1..{VOICE_CHUNK_MAX}")
+    if offset + len(data) > VOICE_BYTES_MAX:
+        raise ProtocolError("voice chunk runs past the maximum utterance")
+    return encode(MsgType.VOICE_CHUNK, struct.pack(">I", offset) + data)
+
+
+def decode_voice_chunk(payload: bytes) -> tuple[int, bytes]:
+    if not 5 <= len(payload) <= 4 + VOICE_CHUNK_MAX:
+        raise ProtocolError(f"voice chunk payload {len(payload)} outside 5..{4 + VOICE_CHUNK_MAX}")
+    offset = struct.unpack(">I", payload[:4])[0]
+    data = payload[4:]
+    if offset + len(data) > VOICE_BYTES_MAX:
+        raise ProtocolError("voice chunk runs past the maximum utterance")
+    return offset, data
+
+
+def encode_voice_end(total: int, crc: int) -> bytes:
+    if not 1 <= total <= VOICE_BYTES_MAX:
+        raise ProtocolError(f"voice total {total} outside 1..{VOICE_BYTES_MAX}")
+    if not 0 <= crc <= 0xFFFFFFFF:
+        raise ProtocolError(f"voice crc {crc} does not fit u32")
+    return encode(MsgType.VOICE_END, struct.pack(">II", total, crc))
+
+
+def decode_voice_end(payload: bytes) -> tuple[int, int]:
+    if len(payload) != 8:
+        raise ProtocolError(f"voice end must be 8 bytes, got {len(payload)}")
+    total, crc = struct.unpack(">II", payload)
+    if not 1 <= total <= VOICE_BYTES_MAX:
+        raise ProtocolError(f"voice total {total} outside 1..{VOICE_BYTES_MAX}")
+    return total, crc
+
+
+def encode_mic_ready(can_transcribe: bool) -> bytes:
+    return encode(MsgType.MIC_READY,
+                  bytes((MIC_READY_CAN_TRANSCRIBE if can_transcribe else 0,)))
+
+
+def decode_mic_ready(payload: bytes) -> bool:
+    if len(payload) != 1:
+        raise ProtocolError(f"mic ready must be 1 byte, got {len(payload)}")
+    if payload[0] & ~MIC_READY_CAN_TRANSCRIBE:
+        raise ProtocolError(f"mic ready flags 0x{payload[0]:02x} are reserved")
+    return bool(payload[0] & MIC_READY_CAN_TRANSCRIBE)
+
+
+def encode_voice_ack(acked: int) -> bytes:
+    if not 0 <= acked <= VOICE_BYTES_MAX:
+        raise ProtocolError(f"voice ack {acked} outside 0..{VOICE_BYTES_MAX}")
+    return encode(MsgType.VOICE_ACK, struct.pack(">I", acked))
+
+
+def decode_voice_ack(payload: bytes) -> int:
+    if len(payload) != 4:
+        raise ProtocolError(f"voice ack must be 4 bytes, got {len(payload)}")
+    acked = struct.unpack(">I", payload)[0]
+    if acked > VOICE_BYTES_MAX:
+        raise ProtocolError(f"voice ack {acked} exceeds {VOICE_BYTES_MAX}")
+    return acked
+
+
+def encode_voice_text(status: int, text: str = "") -> bytes:
+    if not 0 <= status <= _VOICE_STATUS_MAX:
+        raise ProtocolError(f"voice status {status} outside 0..{_VOICE_STATUS_MAX}")
+    if status == VOICE_STATUS_OK:
+        try:
+            tb = text.encode("ascii")
+        except UnicodeEncodeError as exc:
+            raise ProtocolError("voice text is not ASCII") from exc
+        if not 1 <= len(tb) <= VOICE_TEXT_MAX:
+            raise ProtocolError(f"voice text length {len(tb)} outside 1..{VOICE_TEXT_MAX}")
+        if any(b != 0x0A and (b < 0x20 or b > 0x7E) for b in tb):
+            raise ProtocolError("voice text must be printable ASCII or newline")
+        return encode(MsgType.VOICE_TEXT, bytes((status,)) + struct.pack(">H", len(tb)) + tb)
+    if text != "":
+        raise ProtocolError("non-OK voice status carries no text")
+    return encode(MsgType.VOICE_TEXT, bytes((status, 0, 0)))
+
+
+def decode_voice_text(payload: bytes) -> tuple[int, str]:
+    if len(payload) < 3:
+        raise ProtocolError(f"voice text payload too short: {len(payload)}")
+    status = payload[0]
+    text_len = struct.unpack(">H", payload[1:3])[0]
+    if status > _VOICE_STATUS_MAX:
+        raise ProtocolError(f"voice status {status} outside 0..{_VOICE_STATUS_MAX}")
+    if len(payload) != 3 + text_len:
+        raise ProtocolError("declared voice text length does not match payload")
+    body = payload[3:]
+    if status == VOICE_STATUS_OK:
+        if not 1 <= text_len <= VOICE_TEXT_MAX:
+            raise ProtocolError(f"voice text length {text_len} outside 1..{VOICE_TEXT_MAX}")
+        if any(b != 0x0A and (b < 0x20 or b > 0x7E) for b in body):
+            raise ProtocolError("voice text must be printable ASCII or newline")
+        return status, body.decode("ascii")
+    if text_len != 0:
+        raise ProtocolError("non-OK voice status carries no text")
+    return status, ""
+

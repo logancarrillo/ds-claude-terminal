@@ -1,5 +1,79 @@
 # Changelog
 
+## 1.2 (unreleased)
+
+### Talk to Claude with your voice
+- Hold **R** in the composer, speak, and let go: your words appear as text.
+- Nothing is sent until you read it and press **A**.
+- **SETTINGS → LINK → MIC → LATCH**: press **L** while holding **R** to keep
+  recording hands-free; tap **R** or **L** to stop.
+- Transcribed on your own computer by a local Whisper. Cloud is used only if
+  you turn it on.
+
+### A controls guide on the DS
+- Hold **SELECT**, then press **START** (or **QUICK → CONTROLS**).
+- A drawing of your console lights each button as you press it.
+- A box on the top screen says what the button or combo does.
+- Labels follow your own button settings. Nothing you press is sent.
+
+### Type in the composer without the stylus
+- Hold **L**, then press **R**: the d-pad walks the keyboard.
+- **A** types the lit key, **START** sends, **X** leaves focus.
+
+### Four languages
+- The DS's menus in English, Spanish, Chinese or Japanese:
+  **SETTINGS → SCREEN → LANGUAGE**.
+- Add your own with `dsterm lang --template`.
+
+### Your own quick commands
+- **QUICK → COMMANDS → + ADD** saves a command on the card.
+- Pick it later to load it into the composer; **A** sends it.
+
+### Simpler settings
+- Five tabs instead of three: SESSION, SOUND, SCREEN, LINK and BUTTONS.
+- Your saved settings carry over.
+
+### A fuller PROJECT page
+- **WATCH**: a focus timer (`dsterm timer 25`) and your own rows.
+- **HEALTH**: the computer's load and free disk. **LOG**: recent commits.
+
+### Fixes
+- Pressing **A** with nothing typed no longer sounds like a prompt was sent.
+- A settings file with an unknown value now keeps every other setting.
+
+### Details
+
+**Voice.**
+- Local backends, in order: `DSTERM_STT_CMD`, mlx-whisper, faster-whisper,
+  openai-whisper, whisper.cpp's `whisper-cli`. mlx-whisper and openai-whisper
+  also need ffmpeg. `dsterm serve` says at every start where recordings go.
+- Cloud (OpenAI, Groq, or your own `DSTERM_STT_URL`) is used only with
+  `dsterm serve --stt-cloud`, only over https, and only when nothing local is
+  installed. An API key set for other programs sends nothing, and a local
+  failure is never retried in the cloud. `--no-mic` turns the microphone
+  off ([SECURITY.md](SECURITY.md)).
+- Up to 15 seconds a recording. The computer gives up at 15 seconds
+  (`DSTERM_STT_TIMEOUT`, at most 17), the DS at 20. The model loads as
+  `dsterm serve` starts (on a first run ever, a download); recordings
+  meanwhile are answered "busy".
+- Transcripts are plain ASCII, so "café" arrives as "cafe". With the DS in
+  Chinese or Japanese, dictation listens for English.
+- Needs this release on both sides. An older server is never sent a voice
+  message, and an older DS never asks.
+
+**Languages.** Chinese and Japanese use Fusion Pixel Font (SIL OFL 1.1),
+drawn for 10-pixel text and cut to the characters the DS uses. Menus are
+laid out from each language's own word widths. What Claude prints is not
+translated.
+
+**PROJECT.** Up to 64 rows with block and sparkline glyphs. A DS still on
+1.0.x gets the 48 rows it can show (NOW, DIFF and DO first) in plain ASCII.
+GitHub Actions runs show only with `dsterm serve --project-ci`, which asks
+GitHub every 30 seconds.
+
+**Settings.** CUSTOMIZE's rows moved to SOUND, SCREEN and LINK. The file
+stores values, not tabs, so nothing needs resetting.
+
 ## 1.0.1 (2026-10-17)
 
 ### Approvals are tied to the prompt they answer

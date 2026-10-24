@@ -37,6 +37,11 @@ int composer_backspace(composer_t *c);
 // Load a snippet straight into EDIT: it is already written, so the next
 // press should be Send.
 int composer_load(composer_t *c, const char *body);
+// Add dictated text after whatever is already written, with one space
+// between them when the buffer does not already end in whitespace.  Bytes
+// the composer would refuse from the keyboard are refused here too, and the
+// buffer's limit cuts the tail.  Returns how many bytes of `text` landed.
+size_t composer_append_text(composer_t *c, const char *text, size_t len);
 
 // The send plan is the body in <=64-byte KEY payloads followed by CR in its
 // own final frame. An empty body therefore still has one frame: the CR.

@@ -97,7 +97,9 @@ class FeedsMixin:
         if signature == c.feeds.project_signature:
             return
         c.feeds.project_signature = signature
-        for frame in dsproject.encode(rows):
+        # A 1.0.x card (no "project64") gets the 48 rows it can hold, in the
+        # ASCII it can draw; see project.encode.
+        for frame in dsproject.encode(rows, project64=c.caps.project64):
             c.outbox.append(frame)
 
     def _advertise_clip(self, c: ClientState) -> None:
@@ -193,7 +195,8 @@ class FeedsMixin:
 
     # -- what the core calls (server.py) -------------------------------------
 
-    def _init_feeds(self, cwd, snippets_path, clip_enabled: bool) -> None:
+    def _init_feeds(self, cwd, snippets_path, clip_enabled: bool,
+                    project_ci: bool = False) -> None:
         """The snippets file, the project and clipboard pollers, and the
         slash commands' clock."""
         # Read on every connect, not here: editing the file and reconnecting is
@@ -203,7 +206,9 @@ class FeedsMixin:
         # against a large working directory one snapshot measured 1.59 s.
         # Polled inline that is over half of every interval with no frames
         # reaching the handheld. See BackgroundCollector for the measurements.
-        self._project = dsproject.BackgroundCollector(cwd or ".")
+        # project_ci (--project-ci) adds GitHub Actions runs to WATCH: `gh run
+        # list`, a network call every 30 s, so off unless asked for.
+        self._project = dsproject.BackgroundCollector(cwd or ".", ci=project_ci)
         # Off unless --clip was passed. The link is encrypted (SEAL v3), but
         # bridging a clipboard still widens where every copy goes: anything
         # copied on any machine synced to this one reaches the DS. A feature

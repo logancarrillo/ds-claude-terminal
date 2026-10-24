@@ -285,6 +285,15 @@ unsigned project_actions_dropped(const project_t *project)
     return wanted > PROJECT_ACTIONS_MAX ? wanted - PROJECT_ACTIONS_MAX : 0u;
 }
 
+int project_action_keyable(const char *body)
+{
+    if (!body || !body[0]) return 0;
+    for (const unsigned char *p = (const unsigned char *)body; *p; p++) {
+        if (*p < 0x20 || *p > 0x7E) return 0;
+    }
+    return 1;
+}
+
 void project_action_select(project_t *project, int delta)
 {
     if (!project || delta == 0) return;

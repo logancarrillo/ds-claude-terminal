@@ -91,13 +91,6 @@ static const option_t BUTTON_OPTIONS[] = {
     { "STOP", NULL, "stop"   },
 };
 
-// The fixed buttons: one chip each, saying what the button does.  Pressing
-// it does nothing; the note says why.
-static const option_t FIXED_SELECT_OPTIONS[] = { { "SCREENS", NULL, NULL } };
-static const option_t FIXED_DPAD_OPTIONS[]   = { { "ARROWS",  NULL, NULL } };
-static const option_t FIXED_L_OPTIONS[]      = { { "CTRL",    NULL, NULL } };
-static const option_t FIXED_R_OPTIONS[]      = { { "SHIFT",   NULL, NULL } };
-
 // The camera screen's shutter, in buttons.h's order.  File words are the
 // lowercase key names.
 static const option_t SHUTTER_OPTIONS[] = {
@@ -119,6 +112,19 @@ static const option_t THEME_OPTIONS[] = {
     { "MOSS", NULL, "moss" },
     { "MONO", NULL, "mono" },
 };
+
+// Built-in UI languages; custom .lang files loaded from /dsterm/lang/ append
+// up to two more chips via lang_count() / lang_label().
+static const option_t LANGUAGE_OPTIONS[] = {
+    { "EN", NULL, "en" },
+    { "ES", NULL, "es" },
+    { "ZH", NULL, "zh" },
+    { "JA", NULL, "ja" },
+};
+// One chip per built-in: the ROWS entry counts them by LANG_BUILTIN_COUNT.
+_Static_assert(sizeof(LANGUAGE_OPTIONS) / sizeof(LANGUAGE_OPTIONS[0]) ==
+                   LANG_BUILTIN_COUNT,
+               "LANGUAGE_OPTIONS must list every built-in language");
 
 static const option_t AUTOCONNECT_OPTIONS[] = {
     { "ON",  NULL, "on"  },
@@ -147,6 +153,11 @@ static const option_t LIVEVIEW_OPTIONS[] = {
     { "COLOUR", NULL, "colour" },
 };
 
+static const option_t MIC_OPTIONS[] = {
+    { "HOLD",  NULL, "hold"  },
+    { "LATCH", NULL, "latch" },
+};
+
 static const option_t GOD_OPTIONS[] = {
     { "OFF",   NULL, "off" },
     { "ARMED", NULL, "on"  },
@@ -155,6 +166,12 @@ static const option_t GOD_OPTIONS[] = {
 // One chip whose label changes once it is armed, rather than two chips where
 // one of them is never the one you want. The confirm lives in settings_ui_t,
 // so it cannot be saved and cannot survive leaving the page.
+// CONTROLS is a door to the guide rather than a value: one chip, nothing
+// stored, nothing typed.
+static const option_t CONTROLS_OPTIONS[] = {
+    { "OPEN", NULL, NULL },
+};
+
 static const option_t DEFAULTS_OPTIONS[] = {
     { "RESET", NULL, NULL },
 };
@@ -176,29 +193,31 @@ static const struct {
     { "GOD MODE", "PROJECT actions fire without a read",
       GOD_OPTIONS, 2, SETTINGS_TAB_SESSION, 0 },
     { "SOUND", "soft desk sounds, square wave, or none",
-      SOUND_OPTIONS, 3, SETTINGS_TAB_CUSTOMIZE, 0 },
+      SOUND_OPTIONS, 3, SETTINGS_TAB_SOUND, 0 },
     { "VOLUME", "for the room you are in; plays a sample",
-      VOLUME_OPTIONS, 3, SETTINGS_TAB_CUSTOMIZE, 0 },
+      VOLUME_OPTIONS, 3, SETTINGS_TAB_SOUND, 0 },
     { "TYPING", "your own key clicks; alerts stay on",
-      TYPING_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
+      TYPING_OPTIONS, 2, SETTINGS_TAB_SOUND, 0 },
     { "WRITING", "soft typing while Claude writes; how much",
-      BLIPS_OPTIONS, 4, SETTINGS_TAB_CUSTOMIZE, 0 },
+      BLIPS_OPTIONS, 4, SETTINGS_TAB_SOUND, 0 },
     { "THEME", "the accent colour, Claude's included",
-      THEME_OPTIONS, 4, SETTINGS_TAB_CUSTOMIZE, 0 },
+      THEME_OPTIONS, 4, SETTINGS_TAB_SCREEN, 0 },
+    { "LANGUAGE", "UI language (and custom /dsterm/lang)",
+      LANGUAGE_OPTIONS, LANG_BUILTIN_COUNT, SETTINGS_TAB_SCREEN, 0 },
     { "ON BOOT", "which screen the card comes up on",
-      BOOT_OPTIONS, 3, SETTINGS_TAB_CUSTOMIZE, 0 },
-    { "AUTOCONNECT", "at startup, to the last computer",
-      AUTOCONNECT_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
+      BOOT_OPTIONS, 3, SETTINGS_TAB_SCREEN, 0 },
     { "ADDRESSES", "hide IP addresses, for a demo or a photo",
-      ADDRESSES_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
+      ADDRESSES_OPTIONS, 2, SETTINGS_TAB_SCREEN, 0 },
+    { "AUTOCONNECT", "at startup, to the last computer",
+      AUTOCONNECT_OPTIONS, 2, SETTINGS_TAB_LINK, 0 },
     { "VIEW TAPS", "clicks in dsterm view tap this DS",
-      VIEW_TAPS_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
+      VIEW_TAPS_OPTIONS, 2, SETTINGS_TAB_LINK, 0 },
     { "PICTURE", "640x480, or 320x240 to send it 4x faster",
-      PICTURE_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
+      PICTURE_OPTIONS, 2, SETTINGS_TAB_LINK, 0 },
     { "LIVE VIEW", "computer's view: sharp greys, or colour",
-      LIVEVIEW_OPTIONS, 2, SETTINGS_TAB_CUSTOMIZE, 0 },
-    { "DEFAULTS", "press twice; resets every tab",
-      DEFAULTS_OPTIONS, 1, SETTINGS_TAB_CUSTOMIZE, 0 },
+      LIVEVIEW_OPTIONS, 2, SETTINGS_TAB_LINK, 0 },
+    { "MIC", "hold R, or press L with R held to latch",
+      MIC_OPTIONS, 2, SETTINGS_TAB_LINK, 0 },
     // Short labels and chips that start further left: six actions a row.
     { "A", "what A sends on Control and KEYS",
       BUTTON_OPTIONS, 6, SETTINGS_TAB_BUTTONS, 46 },
@@ -210,22 +229,12 @@ static const struct {
       BUTTON_OPTIONS, 6, SETTINGS_TAB_BUTTONS, 46 },
     { "START", "what START sends on Control and KEYS",
       BUTTON_OPTIONS, 6, SETTINGS_TAB_BUTTONS, 46 },
-    { "SHUTTER", "the camera screen's shutter; L+R still leaves",
+    { "SHUTTER", "the camera's shutter; L+R still leaves",
       SHUTTER_OPTIONS, 3, SETTINGS_TAB_BUTTONS, 46 },
-    { "SELECT", "fixed: cycles the bottom screens",
-      FIXED_SELECT_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 46 },
-    { "D-PAD", "fixed: arrows; on Control, scrolls back",
-      FIXED_DPAD_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 46 },
-    { "L", "fixed: Ctrl for the next key; L+R focus",
-      FIXED_L_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 46 },
-    { "R", "fixed: Shift for the next key; takes the camera's picture",
-      FIXED_R_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 46 },
-    { "RESET", "press twice; these buttons back as they were",
-      DEFAULTS_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 46 },
-};
-
-static const char *const TAB_LABELS[SETTINGS_TAB_COUNT] = {
-    "SESSION", "CUSTOMIZE", "BUTTONS",
+    { "CONTROLS", "every button and combo, tried safely",
+      CONTROLS_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 0 },
+    { "DEFAULTS", "press twice; resets every tab",
+      DEFAULTS_OPTIONS, 1, SETTINGS_TAB_BUTTONS, 0 },
 };
 
 // Whether this card has a camera, set once at boot from isDSiMode().  Default
@@ -278,12 +287,14 @@ void settings_defaults(settings_t *settings)
     settings->autoconnect = 1;
     settings->hide_addresses = 0;
     settings->view_taps = 0;
+    settings->language = LANG_EN;
     // The one setting whose default is not a taste. It is a safety rule, and a
     // safety rule that ships switched off is not one.
     settings->god_mode = 0;
     settings->camera_shutter = SHUTTER_R;
     settings->picture = SETTINGS_PICTURE_FULL;
     settings->liveview = SETTINGS_LIVEVIEW_GREY;
+    settings->mic_mode = SETTINGS_MIC_HOLD;
 }
 
 void settings_ui_init(settings_ui_t *ui)
@@ -324,19 +335,39 @@ int settings_valid(const settings_t *settings)
     if (settings->picture < 0 || settings->picture >= SETTINGS_PICTURE_COUNT) {
         return 0;
     }
+    if (settings->mic_mode < 0 || settings->mic_mode >= SETTINGS_MIC_COUNT) {
+        return 0;
+    }
+    if (settings->language >= lang_count()) return 0;
     return settings->god_mode == 0 || settings->god_mode == 1;
 }
 
 const char *settings_row_label(settings_row_t row)
 {
+    switch (row) {
+    case SETTINGS_ROW_MODEL:       return tr(TR_SETTINGS_ROW_MODEL);
+    case SETTINGS_ROW_SESSION:     return tr(TR_SETTINGS_ROW_SESSION);
+    case SETTINGS_ROW_GOD_MODE:    return tr(TR_SETTINGS_ROW_GOD_MODE);
+    case SETTINGS_ROW_SOUND:       return tr(TR_SETTINGS_ROW_SOUND);
+    case SETTINGS_ROW_VOLUME:      return tr(TR_SETTINGS_ROW_VOLUME);
+    case SETTINGS_ROW_TYPING:      return tr(TR_SETTINGS_ROW_TYPING);
+    case SETTINGS_ROW_BLIPS:       return tr(TR_SETTINGS_ROW_BLIPS);
+    case SETTINGS_ROW_THEME:       return tr(TR_SETTINGS_ROW_THEME);
+    case SETTINGS_ROW_LANGUAGE:    return tr(TR_SETTINGS_ROW_LANGUAGE);
+    case SETTINGS_ROW_BOOT:        return tr(TR_SETTINGS_ROW_BOOT);
+    case SETTINGS_ROW_ADDRESSES:   return tr(TR_SETTINGS_ROW_ADDRESSES);
+    case SETTINGS_ROW_AUTOCONNECT: return tr(TR_SETTINGS_ROW_AUTOCONNECT);
+    case SETTINGS_ROW_VIEW_TAPS:   return tr(TR_SETTINGS_ROW_VIEW_TAPS);
+    case SETTINGS_ROW_PICTURE:     return tr(TR_SETTINGS_ROW_PICTURE);
+    case SETTINGS_ROW_LIVEVIEW:    return tr(TR_SETTINGS_ROW_LIVEVIEW);
+    case SETTINGS_ROW_MIC:         return tr(TR_SETTINGS_ROW_MIC);
+    case SETTINGS_ROW_SHUTTER:     return tr(TR_SETTINGS_ROW_SHUTTER);
+    case SETTINGS_ROW_CONTROLS:    return tr(TR_SETTINGS_ROW_CONTROLS);
+    case SETTINGS_ROW_DEFAULTS:    return tr(TR_SETTINGS_ROW_DEFAULTS);
+    default:                       break;
+    }
     if ((unsigned)row >= SETTINGS_ROW_COUNT) return "";
     return ROWS[row].label;
-}
-
-int settings_row_fixed(settings_row_t row)
-{
-    return row == SETTINGS_ROW_FIXED_SELECT || row == SETTINGS_ROW_FIXED_DPAD ||
-           row == SETTINGS_ROW_FIXED_L || row == SETTINGS_ROW_FIXED_R;
 }
 
 unsigned settings_tab_rows(unsigned tab)
@@ -356,7 +387,14 @@ unsigned settings_row_tab(settings_row_t row)
 
 const char *settings_tab_label(unsigned tab)
 {
-    return tab < SETTINGS_TAB_COUNT ? TAB_LABELS[tab] : "";
+    switch (tab) {
+    case SETTINGS_TAB_SESSION: return tr(TR_SETTINGS_TAB_SESSION);
+    case SETTINGS_TAB_SOUND:   return tr(TR_SETTINGS_TAB_SOUND);
+    case SETTINGS_TAB_SCREEN:  return tr(TR_SETTINGS_TAB_SCREEN);
+    case SETTINGS_TAB_LINK:    return tr(TR_SETTINGS_TAB_LINK);
+    case SETTINGS_TAB_BUTTONS: return tr(TR_SETTINGS_TAB_BUTTONS);
+    default:                   return "";
+    }
 }
 
 uint16_t settings_theme_rgb(settings_theme_t theme)
@@ -374,18 +412,26 @@ const char *settings_row_note(settings_row_t row)
 unsigned settings_option_count(settings_row_t row)
 {
     if ((unsigned)row >= SETTINGS_ROW_COUNT) return 0;
+    if (row == SETTINGS_ROW_LANGUAGE) return lang_count();
     return ROWS[row].count;
 }
 
 static const option_t *option_at(settings_row_t row, unsigned option)
 {
     if ((unsigned)row >= SETTINGS_ROW_COUNT) return NULL;
+    if (row == SETTINGS_ROW_LANGUAGE) {
+        if (option >= lang_count()) return NULL;
+        return &LANGUAGE_OPTIONS[option < LANG_BUILTIN_COUNT ? option : 0];
+    }
     if (option >= ROWS[row].count) return NULL;
     return &ROWS[row].options[option];
 }
 
 const char *settings_option_label(settings_row_t row, unsigned option)
 {
+    if (row == SETTINGS_ROW_LANGUAGE) {
+        return option < lang_count() ? lang_label(option) : "";
+    }
     const option_t *entry = option_at(row, option);
     return entry ? entry->label : "";
 }
@@ -425,6 +471,8 @@ unsigned settings_option_current(const settings_t *settings, settings_row_t row)
         return (unsigned)settings->picture;
     case SETTINGS_ROW_LIVEVIEW:
         return (unsigned)settings->liveview;
+    case SETTINGS_ROW_MIC:
+        return (unsigned)settings->mic_mode;
     case SETTINGS_ROW_AUTOCONNECT:
         return settings->autoconnect ? 0u : 1u;      // ON is the first chip
     case SETTINGS_ROW_ADDRESSES:
@@ -435,9 +483,12 @@ unsigned settings_option_current(const settings_t *settings, settings_row_t row)
         return settings->typing ? 0u : 1u;
     case SETTINGS_ROW_THEME:
         return (unsigned)settings->theme;
+    case SETTINGS_ROW_LANGUAGE:
+        return settings->language < lang_count() ? settings->language : 0u;
     case SETTINGS_ROW_GOD_MODE:
         return settings->god_mode ? 1u : 0u;
     case SETTINGS_ROW_SESSION:
+    case SETTINGS_ROW_CONTROLS:
     case SETTINGS_ROW_DEFAULTS:
     case SETTINGS_ROW_COUNT:
     default:
@@ -535,7 +586,7 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
     ui->option = option;
     ui->refused = 0;
     // Any press that is not a reset chip disarms the confirm.
-    if (row != SETTINGS_ROW_DEFAULTS && row != SETTINGS_ROW_BUTTONS_RESET) {
+    if (row != SETTINGS_ROW_DEFAULTS) {
         ui->reset_armed = 0;
     }
 
@@ -619,20 +670,11 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
         settings->liveview = (settings_liveview_t)option;
         return SETTINGS_PRESS_CHANGED;
 
-    case SETTINGS_ROW_FIXED_SELECT:
-    case SETTINGS_ROW_FIXED_DPAD:
-    case SETTINGS_ROW_FIXED_L:
-    case SETTINGS_ROW_FIXED_R:
-        return SETTINGS_PRESS_NOTHING;
-
-    case SETTINGS_ROW_BUTTONS_RESET:
-        if (!ui->reset_armed) {
-            ui->reset_armed = 1;
+    case SETTINGS_ROW_MIC:
+        if (settings->mic_mode == (settings_mic_t)option) {
             return SETTINGS_PRESS_NOTHING;
         }
-        button_map_defaults(&settings->buttons);
-        settings->camera_shutter = SHUTTER_R;
-        ui->reset_armed = 0;
+        settings->mic_mode = (settings_mic_t)option;
         return SETTINGS_PRESS_CHANGED;
 
     case SETTINGS_ROW_TYPING: {
@@ -647,6 +689,14 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
             return SETTINGS_PRESS_NOTHING;
         }
         settings->theme = (settings_theme_t)option;
+        return SETTINGS_PRESS_CHANGED;
+
+    case SETTINGS_ROW_LANGUAGE:
+        if (option >= lang_count() || settings->language == option) {
+            return SETTINGS_PRESS_NOTHING;
+        }
+        settings->language = option;
+        lang_set_current(option);
         return SETTINGS_PRESS_CHANGED;
 
     case SETTINGS_ROW_AUTOCONNECT: {
@@ -677,12 +727,17 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
         return SETTINGS_PRESS_CHANGED;
     }
 
+    case SETTINGS_ROW_CONTROLS:
+        // Nothing to store: the caller opens the guide.
+        return SETTINGS_PRESS_GUIDE;
+
     case SETTINGS_ROW_DEFAULTS:
         if (!ui->reset_armed) {
             ui->reset_armed = 1;
             return SETTINGS_PRESS_NOTHING;
         }
         settings_defaults(settings);
+        lang_set_current(settings->language);
         ui->reset_armed = 0;
         return SETTINGS_PRESS_RESET;
 
@@ -697,11 +752,93 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
 #define SETTINGS_ROW_W 248
 #define CHIP_GAP 3
 #define CHIP_PAD 10     // five pixels of margin either side of the text
+#define TAB_GAP  2
+#define TAB_PAD  6      // three pixels of margin either side so 5 tabs fit 256px
 #define GLYPH_W 6
 
 static int chip_width(const char *label)
 {
-    return (int)strlen(label) * GLYPH_W + CHIP_PAD;
+    return (int)lang_display_cols(label) * GLYPH_W + CHIP_PAD;
+}
+
+// The option column never moves further right than this, however long a
+// pack's row label: past it the label is cut (subscreen.c), not the chips.
+#define OPTION_X_MAX 124
+// The "L/R" hint at the tab row's right end: three glyphs and a margin
+// (subscreen.c draws it 4 px in from the edge).
+#define TAB_HINT_W (3 * GLYPH_W + 6)
+// Room for the tab chips: the row, less the hint.
+#define TAB_ROW_W (256 - SETTINGS_TAB_X - TAB_HINT_W - (int)(SETTINGS_TAB_COUNT - 1) * TAB_GAP)
+
+static int tab_chip_natural(const char *label)
+{
+    return (int)lang_display_cols(label) * GLYPH_W + TAB_PAD;
+}
+
+// A custom /dsterm/lang pack can name a tab anything up to 63 bytes. The
+// chips keep their own widths while they fit -- every built-in language
+// does -- and when they would not, only the widest give way: the largest
+// cap at which they all fit, so short names are never squeezed for a long
+// one. draw_tile cuts a label that no longer fits on a whole character.
+static int tab_chip_width(const char *label)
+{
+    int natural[SETTINGS_TAB_COUNT];
+    int total = 0, widest = 0;
+    for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
+        natural[t] = tab_chip_natural(settings_tab_label(t));
+        total += natural[t];
+        if (natural[t] > widest) widest = natural[t];
+    }
+    const int own = tab_chip_natural(label);
+    if (total <= TAB_ROW_W) return own;
+    int cap = widest;
+    while (cap > GLYPH_W + TAB_PAD) {
+        int sum = 0;
+        for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
+            sum += natural[t] < cap ? natural[t] : cap;
+        }
+        if (sum <= TAB_ROW_W) break;
+        cap--;
+    }
+    return own < cap ? own : cap;
+}
+
+// Where a row's label, in the current language, needs its chips to start:
+// the label's width and a glyph of air.
+static int label_need(settings_row_t row)
+{
+    return SETTINGS_LABEL_X +
+           (int)lang_display_cols(settings_row_label(row)) * GLYPH_W + 6;
+}
+
+// Six chips a row leave less room to give: a 6-chip button row's column moves
+// at most this far right of its own (the longest built-in label, JA's shutter
+// row, needs 24).
+#define OPTION_X_GIVE 30
+
+int settings_row_option_x(settings_row_t row)
+{
+    if ((unsigned)row >= SETTINGS_ROW_COUNT) return SETTINGS_OPTION_X;
+    // Rows with their own narrower option column (the 6-chip button rows)
+    // still push their chips right if a translated label is wider than that
+    // column.  Every other row on a tab aligns to the widest label on that
+    // tab in the current language (at least SETTINGS_OPTION_X).
+    if (ROWS[row].option_x) {
+        int need = label_need(row);
+        const int cap = ROWS[row].option_x + OPTION_X_GIVE;
+        if (need > cap) need = cap;
+        return need > ROWS[row].option_x ? need : ROWS[row].option_x;
+    }
+    int col = SETTINGS_OPTION_X;
+    const unsigned tab = ROWS[row].tab;
+    for (unsigned i = 0; i < SETTINGS_ROW_COUNT; i++) {
+        if (ROWS[i].tab != tab || ROWS[i].option_x || !row_present((settings_row_t)i)) {
+            continue;
+        }
+        const int need = label_need((settings_row_t)i);
+        if (need > col) col = need;
+    }
+    return col < OPTION_X_MAX ? col : OPTION_X_MAX;
 }
 
 // A row's place within its own tab: rows of the other tab are not on screen
@@ -729,6 +866,17 @@ int settings_row_rect(settings_row_t row, unsigned scroll,
     return 1;
 }
 
+// A chip is as wide as its label -- except DEFAULTS', which renames itself
+// SURE? while armed (subscreen.c) and is sized for the wider of its two
+// words, so the armed word is never cut and the chip never jumps.
+static int option_chip_width(settings_row_t row, unsigned option)
+{
+    const int w = chip_width(settings_option_label(row, option));
+    if (row != SETTINGS_ROW_DEFAULTS) return w;
+    const int armed = chip_width(tr(TR_SETTINGS_RESET_SURE));
+    return armed > w ? armed : w;
+}
+
 int settings_option_rect(settings_row_t row, unsigned option, unsigned scroll,
                          int *x, int *y, int *w, int *h)
 {
@@ -738,13 +886,13 @@ int settings_option_rect(settings_row_t row, unsigned option, unsigned scroll,
     if (!settings_row_rect(row, scroll, NULL, &ry, NULL, NULL)) return 0;
     // Walk the row from the left, so a chip's position is a function of the
     // labels before it and nothing else.
-    int at = ROWS[row].option_x ? ROWS[row].option_x : SETTINGS_OPTION_X;
+    int at = settings_row_option_x(row);
     for (unsigned i = 0; i < option; i++) {
-        at += chip_width(ROWS[row].options[i].label) + CHIP_GAP;
+        at += option_chip_width(row, i) + CHIP_GAP;
     }
     if (x) *x = at;
     if (y) *y = ry + (SETTINGS_ROW_H - SETTINGS_OPTION_H) / 2;
-    if (w) *w = chip_width(entry->label);
+    if (w) *w = option_chip_width(row, option);
     if (h) *h = SETTINGS_OPTION_H;
     return 1;
 }
@@ -753,10 +901,12 @@ int settings_tab_rect(unsigned tab, int *x, int *y, int *w, int *h)
 {
     if (tab >= SETTINGS_TAB_COUNT) return 0;
     int at = SETTINGS_TAB_X;
-    for (unsigned i = 0; i < tab; i++) at += chip_width(TAB_LABELS[i]) + CHIP_GAP;
+    for (unsigned i = 0; i < tab; i++) {
+        at += tab_chip_width(settings_tab_label(i)) + TAB_GAP;
+    }
     if (x) *x = at;
     if (y) *y = SETTINGS_TAB_Y;
-    if (w) *w = chip_width(TAB_LABELS[tab]);
+    if (w) *w = tab_chip_width(settings_tab_label(tab));
     if (h) *h = SETTINGS_TAB_H;
     return 1;
 }
@@ -872,9 +1022,13 @@ void settings_render(const settings_t *settings, const settings_ui_t *ui,
     put_text(grid, 0, 0, "SETTINGS", FG_ORANGE);
     put_text(grid, 0, 9, tab == SETTINGS_TAB_SESSION
                              ? "-- SESSION: what reaches Claude"
-                             : tab == SETTINGS_TAB_BUTTONS
-                             ? "-- BUTTONS: what each one sends"
-                             : "-- CUSTOMIZE: this device, yours",
+                             : tab == SETTINGS_TAB_SOUND
+                             ? "-- SOUND: cues, volume, typing"
+                             : tab == SETTINGS_TAB_SCREEN
+                             ? "-- SCREEN: theme, language, boot"
+                             : tab == SETTINGS_TAB_LINK
+                             ? "-- LINK: connection, camera, mic"
+                             : "-- BUTTONS: what each one sends",
              FG_PLAIN);
 
     // Rows 2..6: every row and its current value, so the top screen says what
@@ -889,7 +1043,7 @@ void settings_render(const settings_t *settings, const settings_ui_t *ui,
         const int line = 2 + shown++;
         const int selected = (unsigned)i == ui->row;
         put_text(grid, line, 0, selected ? ">" : " ", FG_ORANGE);
-        put_text(grid, line, 2, settings_row_label(row),
+        put_text(grid, line, 2, ROWS[row].label,
                  selected ? FG_ORANGE : FG_PLAIN);
 
         const unsigned current = settings_option_current(settings, row);
@@ -898,9 +1052,6 @@ void settings_render(const settings_t *settings, const settings_ui_t *ui,
                      settings_option_label(row, current),
                      row == SETTINGS_ROW_GOD_MODE && settings->god_mode
                          ? FG_RED : FG_PLAIN);
-        } else if (settings_row_fixed(row)) {
-            put_text(grid, line, value_col, settings_option_label(row, 0), FG_PLAIN);
-            put_text(grid, line, value_col + 9, "(fixed)", FG_PLAIN);
         } else if (row == SETTINGS_ROW_MODEL) {
             // Honest about what this card can and cannot see: the model is
             // Claude Code's setting, and the card is never told it.
@@ -929,9 +1080,7 @@ void settings_render(const settings_t *settings, const settings_ui_t *ui,
                  FG_ORANGE);
     } else if (ui->reset_armed) {
         put_text(grid, note_line + 1, 0,
-                 ui->row == SETTINGS_ROW_BUTTONS_RESET
-                     ? "press SURE? to put these buttons back"
-                     : "press SURE? to reset every tab",
+                 "press SURE? to reset every tab",
                  FG_ORANGE);
     }
 
@@ -949,7 +1098,7 @@ void settings_render(const settings_t *settings, const settings_ui_t *ui,
     const char *const ext_label = about && about->ext_label[0] ?
                                   about->ext_label : NULL;
     const int rows = ext_label ? 5 : 4;
-    // A long tab (CUSTOMIZE on a card with a camera) pushes ABOUT down; the
+    // A long tab (LINK on a card with a camera) pushes ABOUT down; the
     // gaps around it give way first, so its last line -- whether the
     // settings were saved -- is not the one that falls off the screen.
     int about_line = note_line + 4;
@@ -1052,6 +1201,13 @@ int settings_parse(const char *text, settings_t *settings,
 
     settings_t parsed;
     settings_defaults(&parsed);
+    // What an unreadable value falls back to: its own key's default, never
+    // the whole page's.  A hand edit, a value from a later build or a pack
+    // removed from the SD costs that one setting and nothing beside it
+    // (the handoff's rule 3).  The last value for a key wins, so a bad one
+    // after a good one is the default too, as if it were the only line.
+    settings_t fallback;
+    settings_defaults(&fallback);
     int seen_version = 0;
     const char *at = text;
 
@@ -1103,17 +1259,9 @@ int settings_parse(const char *text, settings_t *settings,
             }
             seen_version = 1;
         } else if (ascii_equal(key, "model")) {
-            if (!parse_model(value, &parsed.model)) {
-                fail(err, err_len, "unknown model");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_model(value, &parsed.model)) parsed.model = fallback.model;
         } else if (ascii_equal(key, "boot")) {
-            if (!parse_boot(value, &parsed.boot)) {
-                fail(err, err_len, "unknown boot screen");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_boot(value, &parsed.boot)) parsed.boot = fallback.boot;
         } else if (ascii_equal(key, "sound")) {
             unsigned v;
             // "soft" is what the chip says; "snes" is what cards have on
@@ -1121,17 +1269,13 @@ int settings_parse(const char *text, settings_t *settings,
             if (ascii_equal(value, "soft")) {
                 v = SETTINGS_SOUND_SNES;
             } else if (!parse_word(value, SOUND_OPTIONS, SETTINGS_SOUND_COUNT, &v)) {
-                fail(err, err_len, "unknown sound");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.sound;
             }
             parsed.sound = (settings_sound_t)v;
         } else if (ascii_equal(key, "volume")) {
             unsigned v;
             if (!parse_word(value, VOLUME_OPTIONS, SETTINGS_VOLUME_COUNT, &v)) {
-                fail(err, err_len, "unknown volume");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.volume;
             }
             parsed.volume = (settings_volume_t)v;
         } else if (ascii_equal(key, "blips")) {
@@ -1140,91 +1284,74 @@ int settings_parse(const char *text, settings_t *settings,
             if (ascii_equal(value, "on")) {
                 v = SETTINGS_WRITING_MID;
             } else if (!parse_word(value, BLIPS_OPTIONS, 4, &v)) {
-                fail(err, err_len, "invalid blips");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.blips;
             }
             parsed.blips = (int)v;
         } else if (ascii_equal(key, "button_a") || ascii_equal(key, "button_b") ||
                    ascii_equal(key, "button_x") || ascii_equal(key, "button_y") ||
                    ascii_equal(key, "button_start")) {
-            unsigned v;
-            if (!parse_word(value, BUTTON_OPTIONS, BUTTON_ACTION_COUNT, &v)) {
-                fail(err, err_len, "unknown button action");
-                settings_defaults(settings);
-                return 0;
-            }
             const char k = (char)(key[7] | 0x20);       // keys match any case
             const button_t b = k == 'a' ? BUTTON_A : k == 'b' ? BUTTON_B :
                                k == 'x' ? BUTTON_X : k == 'y' ? BUTTON_Y
                                         : BUTTON_START;
+            unsigned v;
+            if (!parse_word(value, BUTTON_OPTIONS, BUTTON_ACTION_COUNT, &v)) {
+                v = fallback.buttons.action[b];
+            }
             parsed.buttons.action[b] = (uint8_t)v;
         } else if (ascii_equal(key, "shutter")) {
             unsigned v;
             if (!parse_word(value, SHUTTER_OPTIONS, SHUTTER_COUNT, &v)) {
-                fail(err, err_len, "unknown shutter");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.camera_shutter;
             }
             parsed.camera_shutter = (camera_shutter_t)v;
         } else if (ascii_equal(key, "picture")) {
             unsigned v;
             if (!parse_word(value, PICTURE_OPTIONS, SETTINGS_PICTURE_COUNT,
                             &v)) {
-                fail(err, err_len, "unknown picture");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.picture;
             }
             parsed.picture = (settings_picture_t)v;
         } else if (ascii_equal(key, "liveview")) {
             unsigned v;
             if (!parse_word(value, LIVEVIEW_OPTIONS, SETTINGS_LIVEVIEW_COUNT,
                             &v)) {
-                fail(err, err_len, "unknown liveview");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.liveview;
             }
             parsed.liveview = (settings_liveview_t)v;
         } else if (ascii_equal(key, "typing")) {
-            if (!parse_switch(value, &parsed.typing)) {
-                fail(err, err_len, "invalid typing");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_switch(value, &parsed.typing)) parsed.typing = fallback.typing;
         } else if (ascii_equal(key, "theme")) {
             unsigned v;
             if (!parse_word(value, THEME_OPTIONS, SETTINGS_THEME_COUNT, &v)) {
-                fail(err, err_len, "unknown theme");
-                settings_defaults(settings);
-                return 0;
+                v = (unsigned)fallback.theme;
             }
             parsed.theme = (settings_theme_t)v;
+        } else if (ascii_equal(key, "lang") || ascii_equal(key, "language")) {
+            // A language's valid values also depend on what else is on the
+            // card: a custom pack removed from the SD leaves a code nothing
+            // answers to.  That is a reason to show English, not to throw
+            // away the sound, buttons and theme saved beside it.
+            const int idx = lang_find_code(value);
+            parsed.language = idx < 0 ? fallback.language : (unsigned)idx;
         } else if (ascii_equal(key, "autoconnect")) {
-            if (!parse_switch(value, &parsed.autoconnect)) {
-                fail(err, err_len, "invalid autoconnect");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_switch(value, &parsed.autoconnect)) parsed.autoconnect = fallback.autoconnect;
         } else if (ascii_equal(key, "viewtaps")) {
-            if (!parse_switch(value, &parsed.view_taps)) {
-                fail(err, err_len, "invalid viewtaps");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_switch(value, &parsed.view_taps)) parsed.view_taps = fallback.view_taps;
         } else if (ascii_equal(key, "addresses")) {
             unsigned v;
             if (!parse_word(value, ADDRESSES_OPTIONS, 2, &v)) {
-                fail(err, err_len, "invalid addresses");
-                settings_defaults(settings);
-                return 0;
+                v = fallback.hide_addresses ? 1u : 0u;
             }
             parsed.hide_addresses = v ? 1 : 0;
         } else if (ascii_equal(key, "god_mode")) {
-            if (!parse_switch(value, &parsed.god_mode)) {
-                fail(err, err_len, "invalid god_mode");
-                settings_defaults(settings);
-                return 0;
-            }
+            if (!parse_switch(value, &parsed.god_mode)) parsed.god_mode = fallback.god_mode;
+        } else if (ascii_equal(key, "mic_mode")) {
+            unsigned v;
+            parsed.mic_mode = parse_word(value, MIC_OPTIONS,
+                                         SETTINGS_MIC_COUNT, &v)
+                                  ? (settings_mic_t)v
+                                  : fallback.mic_mode;
         }
         // Unknown keys are ignored, so a file written by a later build still
         // loads on this one rather than resetting somebody's whole page -- and
@@ -1236,6 +1363,10 @@ int settings_parse(const char *text, settings_t *settings,
         settings_defaults(settings);
         return 0;
     }
+    // The button map is valid key by key and can still fail as a whole: no
+    // button left on Enter.  That is the buttons' problem, so the buttons
+    // go back to their defaults and nothing else does.
+    if (!button_map_valid(&parsed.buttons)) parsed.buttons = fallback.buttons;
     if (!settings_valid(&parsed)) {
         fail(err, err_len, "settings failed validation");
         settings_defaults(settings);
@@ -1260,7 +1391,9 @@ int settings_load(const char *path, settings_t *settings,
         fail(err, err_len, "cannot open settings");
         return 0;
     }
-    char text[SETTINGS_FILE_MAX + 1];
+    // Static: over the ~256 bytes a frame on the ARM9's DTCM stack may take.
+    // Loading runs once at boot from the main loop; nothing re-enters.
+    static char text[SETTINGS_FILE_MAX + 1];
     const size_t got = fread(text, 1, sizeof(text) - 1, fh);
     const int read_error = ferror(fh);
     const int close_error = fclose(fh);
@@ -1284,7 +1417,9 @@ int settings_save(const char *path, const settings_t *settings,
         return 0;
     }
 
-    char text[SETTINGS_FILE_MAX];
+    // Static for the same reason as settings_load()'s; saves come from the
+    // main loop one at a time.
+    static char text[SETTINGS_FILE_MAX];
     const int length = snprintf(text, sizeof(text),
                                 "# DS Claude Terminal settings\n"
                                 "version=%d\n"
@@ -1295,6 +1430,7 @@ int settings_save(const char *path, const settings_t *settings,
                                 "blips=%s\n"
                                 "typing=%s\n"
                                 "theme=%s\n"
+                                "lang=%s\n"
                                 "autoconnect=%s\n"
                                 "addresses=%s\n"
                                 "viewtaps=%s\n"
@@ -1306,7 +1442,8 @@ int settings_save(const char *path, const settings_t *settings,
                                 "button_start=%s\n"
                                 "shutter=%s\n"
                                 "picture=%s\n"
-                                "liveview=%s\n",
+                                "liveview=%s\n"
+                                "mic_mode=%s\n",
                                 SETTINGS_VERSION,
                                 model_word(settings->model),
                                 BOOT_OPTIONS[settings->boot].file_word,
@@ -1315,6 +1452,7 @@ int settings_save(const char *path, const settings_t *settings,
                                 BLIPS_OPTIONS[settings->blips].file_word,
                                 settings->typing ? "on" : "off",
                                 THEME_OPTIONS[settings->theme].file_word,
+                                lang_code(settings->language),
                                 settings->autoconnect ? "on" : "off",
                                 settings->hide_addresses ? "hide" : "show",
                                 settings->view_taps ? "on" : "off",
@@ -1326,7 +1464,8 @@ int settings_save(const char *path, const settings_t *settings,
                                 BUTTON_OPTIONS[settings->buttons.action[BUTTON_START]].file_word,
                                 camera_shutter_word(settings->camera_shutter),
                                 PICTURE_OPTIONS[settings->picture].file_word,
-                                LIVEVIEW_OPTIONS[settings->liveview].file_word);
+                                LIVEVIEW_OPTIONS[settings->liveview].file_word,
+                                MIC_OPTIONS[settings->mic_mode].file_word);
     if (length < 0 || (size_t)length >= sizeof(text)) {
         fail(err, err_len, "cannot format settings");
         return 0;

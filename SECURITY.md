@@ -20,10 +20,13 @@
   reusable), and each frame's type and length, which show when you type but
   not what.
 - **The handheld gets the PTY and nothing else.** No message type runs a
-  command or reads a file, and no message from the console names a path; one
-  message from the server — `PHOTO_SAVED` — carries the path of a picture it
-  just saved, and it lands only in the composer. A fully compromised client
-  can type what a person at your keyboard could type, and nothing more.
+  command of the console's choosing or reads a file, and no message from the
+  console names a path; one message from the server — `PHOTO_SAVED` —
+  carries the path of a picture it just saved, and it lands only in the
+  composer. The one message that makes the computer run anything is the end
+  of a recording, and what it runs was fixed when the server started (see
+  **Voice**). A fully compromised client can type what a person at your
+  keyboard could type, and nothing more.
 - **An approval reaches only the prompt it was meant for.** The DS answers a
   permission prompt the way a keyboard does (A is Enter, X is Escape), and
   each prompt gets an id. An Enter pressed while a prompt is open names it,
@@ -45,6 +48,29 @@
   CAMERA ON badge. It is held in memory, never logged, and nothing is
   recorded but a picture you press A to send. The sensor is powered only
   while its screen is open, and the LED lights for either camera.
+- **Voice stays on this computer unless you say otherwise.** Holding **R**
+  in the composer records from the DS's microphone (the strip says
+  LISTENING while it does); the recording goes to this computer over the
+  encrypted link and is transcribed by a local speech-to-text program --
+  `mlx-whisper`, `faster-whisper`, `openai-whisper`, `whisper-cli`, or your
+  own `DSTERM_STT_CMD`. A cloud service (OpenAI, Groq, or `DSTERM_STT_URL`)
+  is used only if you start the server with `--stt-cloud` (or
+  `DSTERM_STT_CLOUD=1` in its environment) and nothing local is installed:
+  an `OPENAI_API_KEY` that happens to be set sends nothing, a local backend
+  that fails is never followed by an upload, a cloud URL must be https, a
+  redirect is refused rather than followed, and a custom URL is sent
+  `DSTERM_STT_KEY`, never your OpenAI key. `dsterm serve` prints where voice
+  goes every time it starts, and `--no-mic` turns the microphone off
+  entirely. The audio is written to a mode-600 temporary file for the
+  transcriber and removed whatever happens; it is never logged or kept. The
+  console contributes samples and a language hint, and only a two- or
+  three-letter code reaches the transcriber's arguments; everything else
+  about what runs was fixed at startup, as arguments, never through a shell,
+  and under a deadline at which it is killed. The transcript -- third-party
+  text, when the cloud was opted in -- is folded to printable ASCII and lands
+  in the composer, where nothing is sent until you press **A**. The first
+  run of a Python Whisper library may download its model weights; that is
+  the library fetching a model, not your audio leaving.
 - **`dsterm view` is the same door as `tmux attach`.** Its socket is mode
   600 in a mode-700 folder, with a uid check on Linux, and what is typed
   through it reaches the session `dsterm attach` already reaches. Its one
@@ -92,8 +118,9 @@
   mode 600, enforced). On the console they live in `/dsterm/servers/*.cfg` on
   the SD card -- treat the card like a password. Nothing is compiled into
   `dsterm.nds`. The card also keeps your last ten prompts, for QUICK's AGAIN,
-  in `/dsterm/recent.txt`.
-- **Showing it to someone.** SETTINGS → CUSTOMIZE → ADDRESSES → HIDE stars out
+  in `/dsterm/recent.txt`, and the quick commands you saved with + ADD in
+  `/dsterm/quick.txt`.
+- **Showing it to someone.** SETTINGS → SCREEN → ADDRESSES → HIDE stars out
   every IP and MAC address the DS draws, for a stream, a video or a photo.
   What Claude's own session prints is not changed.
 
@@ -126,6 +153,7 @@ fail if it stopped being true. CI runs all of them on every push.
 | Malformed input costs the connection, never the server or the card | every decoder and reader | `tests/test_fuzz.py` (decoders, SEAL, the server's own terminal emulator, a live server under card, pre-auth and view noise, and a program printing noise through a real PTY while PINGs are timed), `dsclient/tests/test_fuzz.c` (the frame reader, every server-to-client decoder, SEAL, discovery, the config, profile, snippet, settings and recent-prompt files, short typed texts, the list stagers, WAVs and COMMANDS, each input in an exact-size buffer, under ASan and UBSan) |
 | REMOTE runs only `claude`, with arguments, never a shell | `remote.py`, `server_agents.py` | `tests/test_remote.py` (`test_new_window_argv_is_exact_and_shell_free`, the pick and row-check tests) |
 | `dsterm view`'s socket is this user's only; a tap needs VIEW TAPS | `view.py`, `dsclient/source/main.c` | `tests/test_view.py`; the TOUCH and VIEW TAPS decoders in `dsclient/tests/test_core.c` |
+| Voice is transcribed locally unless `--stt-cloud`; an API key alone uploads nothing; no fallback; one utterance per card under a deadline; a late transcript is dropped | `voice.py` (`choose_backend`, `Transcriber`), `server_voice.py` | `tests/test_voice.py` (`TestBackendChoice`, `test_a_failing_local_backend_never_falls_back_to_the_cloud`, `test_no_backend_and_no_opt_in_says_so_and_uploads_nothing`, the deadline, BUSY and disconnect tests) |
 | Pictures land only in the photo folder; links are refused | `camera.py` | `tests/test_camera.py` (the symlink, retention and discard tests) |
 | The dashboard is loopback only and cannot type | `dashboard.py` | `tests/test_dashboard.py` |
 | Discovery says nothing secret and is rate-limited | `discovery.py` | `tests/test_discovery.py` |
@@ -146,7 +174,11 @@ anything that turns a server-pushed message into a keystroke without the
 composer gate, any frame accepted without a valid SEAL tag on a sealed
 connection, any way a REMOTE pick could run something other than `claude`,
 any out-of-bounds read or write in the client's decoder or WAV reader, and
-any way the dashboard could be reached from outside loopback. On the camera:
+any way the dashboard could be reached from outside loopback. On voice: any
+way a recording could leave the computer without `--stt-cloud`, any way a
+key could reach a host other than its own service, and any way the console
+could influence what the transcriber runs beyond the audio and a two- or
+three-letter language code. On the camera:
 any way a photo write could land outside the photo folder, and any way a
 frame could reach the viewer socket as another user. On `dsterm view`: any
 way another user could open its socket, and any way a tap could act on a DS

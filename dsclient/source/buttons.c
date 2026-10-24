@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "camera.h"
+#include "lang.h"
 
 static const char *const NAMES[BUTTON_COUNT] = { "A", "B", "X", "Y", "START" };
 
@@ -75,6 +76,21 @@ const char *button_action_word(button_action_t action)
     return action < BUTTON_ACTION_COUNT ? ACTIONS[action].word : "";
 }
 
+// The word in a hint, in the language on screen.  button_action_word() stays
+// English: it is also what the settings file stores.
+const char *button_action_hint(button_action_t action)
+{
+    static const tr_id_t HINT[BUTTON_ACTION_COUNT] = {
+        [BUTTON_ENTER]  = TR_BUTTON_ENTER,
+        [BUTTON_SPACE]  = TR_BUTTON_SPACE,
+        [BUTTON_DELETE] = TR_BUTTON_DELETE,
+        [BUTTON_ESC]    = TR_BUTTON_ESC,
+        [BUTTON_TAB]    = TR_BUTTON_TAB,
+        [BUTTON_STOP]   = TR_BUTTON_STOP,
+    };
+    return action < BUTTON_ACTION_COUNT ? tr(HINT[action]) : "";
+}
+
 const char *button_action_bytes(button_action_t action, size_t *len)
 {
     if (action >= BUTTON_ACTION_COUNT) action = BUTTON_ENTER;
@@ -91,7 +107,7 @@ void button_map_legend(const button_map_t *map, char *out, size_t cap)
     // The four face buttons; START has its own line beside SELECT.
     for (unsigned b = BUTTON_A; b <= BUTTON_Y && at < cap; b++) {
         const int n = snprintf(out + at, cap - at, "%s%s %s", b ? "  " : "",
-                               NAMES[b], button_action_word(map->action[b]));
+                               NAMES[b], button_action_hint(map->action[b]));
         if (n < 0) break;
         at += (size_t)n;
     }

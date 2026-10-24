@@ -12,8 +12,9 @@
 // thing somebody actually wants mid-session, that this device can genuinely
 // do, and that has nowhere better to live.
 //
-// Two tabs.  SESSION is what reaches Claude; CUSTOMIZE is this device, and
-// the place to make it yours.  L and R switch between them.
+// Five tabs: SESSION is what reaches Claude; SOUND, SCREEN and LINK are this
+// device, and the place to make it yours; BUTTONS is what the keys do.  L and
+// R move between them.
 //
 // SESSION
 //   MODEL     switch the running session's model.  The reason the page exists.
@@ -22,22 +23,27 @@
 //             key at a time.
 //   GOD MODE  the arming switch for the PROJECT page's one-tap actions.
 //
-// CUSTOMIZE
-//   SOUND     the instrument: the sampled SOFT set (desk sounds), the square-wave CHIP
-//             voice, or OFF.
+// SOUND
+//   SOUND     the instrument: the sampled SOFT set (desk sounds), the
+//             square-wave CHIP voice, or OFF.
 //   VOLUME    how loud, for the room you are in.
 //   TYPING    the clicks of your own keys and the cursor, on or off -- the
 //             sounds that tell Claude's state stay either way.
 //   WRITING   soft typing sounds while Claude writes: OFF, LOW, MID (the
 //             default) or HIGH.  Sparse at first and thinner the longer an
 //             answer runs, so a long one never becomes a drone.
+//
+// SCREEN
 //   THEME     the accent colour: Claude's clay, sea, moss, or mono.
+//   LANGUAGE  EN, ES, ZH, JA, and up to two packs from /dsterm/lang (lang.h).
 //   ON BOOT   which lower screen the card comes up on.
+//   ADDRESSES SHOW or HIDE: hidden, every IP address the card draws is
+//             starred out (privacy.h), for a stream, a video or a photo.
+//
+// LINK
 //   AUTOCONNECT  whether the card connects to the last computer by itself
 //             at startup, after a three-second countdown, or waits in the
 //             menu for you to pick.
-//   ADDRESSES SHOW or HIDE: hidden, every IP address the card draws is
-//             starred out (privacy.h), for a stream, a video or a photo.
 //   VIEW TAPS OFF or ON: whether a click on this DS's bottom screen in
 //             `dsterm view` on the computer taps it.  Off by default: it
 //             lets the computer press anything here, so it is the person
@@ -48,7 +54,8 @@
 //             elsewhere.
 //   LIVE VIEW GREY (128x96, sixteen greys) or COLOUR (96x72, 256 colours):
 //             the camera's view on the computer.  Camera cards only, too.
-//   DEFAULTS  put it all back, behind a confirm.
+//   MIC       HOLD (let go of R to transcribe) or LATCH (press L with R held
+//             to keep recording hands-free).
 //
 // BUTTONS
 //   A, B, X, Y, START   what each sends on the Control and KEYS screens:
@@ -56,9 +63,9 @@
 //             has to stay on one of them.
 //   SHUTTER   the camera screen's shutter: R, L or A (buttons.h).  Only on
 //             a card with a camera -- DSi -- so the row is absent elsewhere.
-//   SELECT, D-PAD, L, R shown, and fixed: they are the way out of anything.
-//   RESET     these five back to A Enter, B Delete, X Esc, Y Tab, START Stop,
-//             and the shutter back to R.
+//   CONTROLS  opens the controls guide (guide.h): every button and combo,
+//             drawn on this console and tried without sending anything.
+//   DEFAULTS  put every tab back, behind a confirm (the chip reads SURE?).
 //
 // Everything about an extension stays behind its own tile. That was the ask
 // and it is also the right line: this page is about the device and the
@@ -97,6 +104,7 @@
 #include <stdint.h>
 
 #include "buttons.h"
+#include "lang.h"
 #include "proto.h"
 
 // Which model the session should be asked to run.
@@ -169,6 +177,14 @@ typedef enum {
     SETTINGS_LIVEVIEW_COUNT,
 } settings_liveview_t;
 
+// Push-to-talk in the composer: hold R the whole time (HOLD), or allow L
+// while holding R to latch the microphone until R or L is tapped (LATCH).
+typedef enum {
+    SETTINGS_MIC_HOLD = 0,
+    SETTINGS_MIC_LATCH,
+    SETTINGS_MIC_COUNT,
+} settings_mic_t;
+
 typedef struct {
     // What was last asked for, not what is running. See SETTINGS_MODEL_UNSET.
     settings_model_t model;
@@ -189,6 +205,8 @@ typedef struct {
     settings_picture_t picture;
     // The computer's live view (settings_liveview_t).  Default GREY.
     settings_liveview_t liveview;
+    // Push-to-talk latch mode (settings_mic_t).  Default HOLD.
+    settings_mic_t mic_mode;
     // Connect to the last computer by itself at startup.  On by default:
     // that is what a card that has been paired is for.
     int autoconnect;
@@ -197,6 +215,9 @@ typedef struct {
     int hide_addresses;
     // `dsterm view`'s clicks tap the bottom screen (main.c).  Off by default.
     int view_taps;
+    // The UI language index (0 = LANG_EN, 1 = LANG_ES, 2 = LANG_ZH, 3 = LANG_JA,
+    // or a loaded custom language from /dsterm/lang/*.lang).
+    unsigned language;
     // Whether a one-tap action on the PROJECT page may reach the PTY without
     // passing through the composer first.
     //
@@ -216,21 +237,24 @@ typedef enum {
     SETTINGS_ROW_MODEL = 0,
     SETTINGS_ROW_SESSION,
     SETTINGS_ROW_GOD_MODE,
-    // CUSTOMIZE
+    // SOUND
     SETTINGS_ROW_SOUND,
     SETTINGS_ROW_VOLUME,
     SETTINGS_ROW_TYPING,
     SETTINGS_ROW_BLIPS,
+    // SCREEN
     SETTINGS_ROW_THEME,
+    SETTINGS_ROW_LANGUAGE,
     SETTINGS_ROW_BOOT,
-    SETTINGS_ROW_AUTOCONNECT,
     SETTINGS_ROW_ADDRESSES,
+    // LINK
+    SETTINGS_ROW_AUTOCONNECT,
     SETTINGS_ROW_VIEW_TAPS,
     // Present only when the card says it has a camera, like SHUTTER: without
     // the sensor the setting would size a picture that cannot be taken.
     SETTINGS_ROW_PICTURE,
     SETTINGS_ROW_LIVEVIEW,
-    SETTINGS_ROW_DEFAULTS,
+    SETTINGS_ROW_MIC,
     // BUTTONS
     SETTINGS_ROW_BUTTON_A,
     SETTINGS_ROW_BUTTON_B,
@@ -240,18 +264,18 @@ typedef enum {
     // Present only when the card says it has a camera: without the sensor
     // the setting would pick the shutter of a screen that cannot open.
     SETTINGS_ROW_SHUTTER,
-    SETTINGS_ROW_FIXED_SELECT,
-    SETTINGS_ROW_FIXED_DPAD,
-    SETTINGS_ROW_FIXED_L,
-    SETTINGS_ROW_FIXED_R,
-    SETTINGS_ROW_BUTTONS_RESET,
+    // Opens the controls guide (guide.h): not a setting, a door.
+    SETTINGS_ROW_CONTROLS,
+    SETTINGS_ROW_DEFAULTS,
     SETTINGS_ROW_COUNT,
 } settings_row_t;
 
 #define SETTINGS_TAB_SESSION 0u
-#define SETTINGS_TAB_CUSTOMIZE 1u
-#define SETTINGS_TAB_BUTTONS 2u
-#define SETTINGS_TAB_COUNT 3u
+#define SETTINGS_TAB_SOUND   1u
+#define SETTINGS_TAB_SCREEN  2u
+#define SETTINGS_TAB_LINK    3u
+#define SETTINGS_TAB_BUTTONS 4u
+#define SETTINGS_TAB_COUNT   5u
 
 // WRITING's levels.
 #define SETTINGS_WRITING_OFF 0
@@ -303,8 +327,6 @@ const char *settings_row_label(settings_row_t row);
 unsigned settings_row_tab(settings_row_t row);
 // How many rows a tab has (some scroll: see SETTINGS_VISIBLE_ROWS).
 unsigned settings_tab_rows(unsigned tab);
-// A fixed BUTTONS row: shown, never changed.
-int settings_row_fixed(settings_row_t row);
 const char *settings_tab_label(unsigned tab);
 // The accent colour a theme stands for, as the DS's RGB15.
 uint16_t settings_theme_rgb(settings_theme_t theme);
@@ -347,6 +369,7 @@ typedef enum {
     SETTINGS_PRESS_CHANGED,      // a stored value moved: apply it and save
     SETTINGS_PRESS_SENDS,        // type `*send` into the session
     SETTINGS_PRESS_RESET,        // defaults restored: apply it and save
+    SETTINGS_PRESS_GUIDE,        // open the controls guide; nothing changed
 } settings_press_t;
 
 // Press one option on one row. Updates `settings` and `ui` in place; `*send`
@@ -375,6 +398,10 @@ settings_press_t settings_press(settings_t *settings, settings_ui_t *ui,
 #define SETTINGS_LABEL_X 4
 #define SETTINGS_OPTION_X 82      // where the chips start, clear of the labels
 #define SETTINGS_OPTION_H 15
+
+// Where a row's chips start in the active language: computed from the widest
+// row label on `row`'s tab so no translated label ever runs under its chips.
+int settings_row_option_x(settings_row_t row);
 
 // `scroll` is settings_ui_t.scroll: rows scrolled out of view have no rect
 // (returns 0), so nothing is drawn or pressed where it is not.

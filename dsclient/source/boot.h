@@ -16,6 +16,7 @@
 #define DSTERM_BOOT_H
 
 #include "config.h"
+#include "console.h"
 #include "remote.h"
 
 // Run the menu until the person (or the countdown) picks a server, then make
@@ -46,6 +47,8 @@ void boot_peers_close(void);
 void boot_peers_list(remote_computers_t *out, const char *host, uint16_t port);
 // "DSi (DSi mode)", "DS Lite" ... (console.h), for the log and ABOUT.
 const char *boot_console_name(void);
+// Which console this is (console.h): the controls guide draws it.
+console_family_t boot_console_family(void);
 // The saved name of the server last connected, for "CLAUDE ON <name>".
 const char *boot_server_name(void);
 // Ready `cfg` to connect to `m`, pairing first (on the boot menu's screens)

@@ -163,6 +163,14 @@ unsigned project_actions(const project_t *project, project_action_t *out,
 // quietly: a list that silently truncates reads as a complete list.
 unsigned project_actions_dropped(const project_t *project);
 
+// Whether an action's body may become keystrokes: non-empty and nothing but
+// printable ASCII (0x20..0x7E).  The PROJECT decoder keeps 0x80..0xBF for the
+// page's glyphs -- blocks, sparklines -- because a row is read before it is
+// pressed; but those same bytes on the PTY are C1 controls (0x9B is a
+// one-byte CSI), so anything turning a row into keys checks this first and
+// refuses the whole action rather than sending or quietly dropping a byte.
+int project_action_keyable(const char *body);
+
 // The selected action, for the d-pad; touch does not need it but a stylus is
 // not always to hand.
 void project_action_select(project_t *project, int delta);

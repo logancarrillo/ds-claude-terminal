@@ -33,6 +33,8 @@ For the console side, see the error table in
 | `[warn] wsl  NAT networking ...` | Run `dsterm wsl-setup`, and use **Scan this network** on the console. Better: switch WSL to mirrored mode |
 | `[ ok ] wsl  mirrored networking -- run dsterm wsl-setup once` | If the console still cannot reach it, run `dsterm wsl-setup` (it is idempotent) |
 | `[warn] wsl  these are WSL's internal addresses` | The console must use the Windows machine's LAN address (the script `wsl-setup` runs prints it) |
+| `[ ok ] voice  Push-to-Talk: transcribed on this computer (...)` | Push-to-talk will work, with the backend named. `sent to ... (cloud ...)` instead means recordings go to that service |
+| `[ ok ] voice  no local speech-to-text (optional: ...)` | Push-to-talk is off until you install one ([Voice](#voice), below). Not a fault |
 
 ## Things `doctor` cannot see
 
@@ -79,6 +81,9 @@ For the console side, see the error table in
 - **A custom sound does not play.** The DS's log (SELECT to STATUS) says which
   file was skipped and why. `dsterm card PATH --sounds FOLDER` checks them on
   the computer first.
+- **A language of your own is missing from LANGUAGE.** The DS's log says
+  `lang: NAME skipped (...)` with the reason. At most two of your own load,
+  from `/dsterm/lang/`; start again from `dsterm lang --template`.
 
 - **Pairing says "pairing is not open".** Run `dsterm pair` on the computer
   first; it stays open for two minutes. Then pick the computer on the DS again.
@@ -143,6 +148,42 @@ For the console side, see the error table in
   — pictures are one per three seconds. "the photo folder's name is not plain
   ASCII" — a `--photo-dir` whose path has a non-ASCII character is refused;
   move it or use the project default.
+
+### Voice
+
+`dsterm doctor` reads the same environment `dsterm serve` does, the `env`
+file included, but not the flags in `serve.conf`, so it does not know about a
+`--stt-cloud` there. The line `dsterm serve` prints at every start (`dsterm
+logs`) is the one that counts, for example `voice: transcribed on this
+computer (faster-whisper)`. The DS's own messages are in its log (SELECT to STATUS):
+
+- **`voice: this computer has no speech-to-text`**, or QUICK's VOICE row says
+  "no speech-to-text on server". Nothing local is installed. Install one
+  ([USING.md](docs/USING.md#voice-push-to-talk)), for example `pipx inject
+  ds-claude-terminal faster-whisper`, then `dsterm restart`. mlx-whisper and
+  openai-whisper also need `ffmpeg` on the service's PATH; without it they
+  are passed over.
+- **`voice: off: --stt-cloud is on, but none of OPENAI_API_KEY, GROQ_API_KEY
+  or DSTERM_STT_URL is set`** (from `dsterm serve`). The cloud is allowed but
+  has nowhere to go: put one of those in the `env` file
+  ([CUSTOMIZING.md](docs/CUSTOMIZING.md#speech-to-text)).
+  **`... but DSTERM_STT_URL is not an https:// URL`**: it must be https.
+- **`voice: server busy`.** The computer is still loading the model, which
+  on the very first start can mean downloading it (minutes), or is still on
+  the previous recording. Wait and try again.
+- **`voice: no speech heard`.** Nothing was recognised. The transcript is
+  plain ASCII, so speech in Chinese or Japanese always arrives empty.
+- **`voice: no speech-to-text on server`** after a recording. The backend
+  failed or took longer than `DSTERM_STT_TIMEOUT`; `dsterm logs` says which
+  (`voice not transcribed: ...` or `no transcript in N s; abandoned`). A
+  local backend that fails is not retried in the cloud.
+- **`voice: timed out waiting for transcription`** or **`still finishing
+  the last recording`.** The DS waited its 20 seconds and gave up; it takes a
+  new recording once the computer's late answer arrives.
+- **`voice: audio damaged`** or **`the computer lost track of the
+  recording`.** The recording did not arrive whole. Record it again.
+- **`voice: the microphone did not start`.** The DS's microphone failed to
+  start; report it with a photo of the STATUS log.
 
 ## The two counter lines on the DS
 

@@ -51,6 +51,20 @@ int composer_load(composer_t *c, const char *body)
     return 1;
 }
 
+size_t composer_append_text(composer_t *c, const char *text, size_t len)
+{
+    if (!c || !text || c->mode != COMPOSER_EDIT) return 0;
+    if (len > 0 && c->len > 0 &&
+        c->body[c->len - 1] != ' ' && c->body[c->len - 1] != '\n') {
+        (void)composer_append(c, ' ');
+    }
+    size_t landed = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (composer_append(c, (uint8_t)text[i])) landed++;
+    }
+    return landed;
+}
+
 size_t composer_frame_count(const composer_t *c)
 {
     return (c->len + BODY_FRAME_MAX - 1) / BODY_FRAME_MAX + 1;

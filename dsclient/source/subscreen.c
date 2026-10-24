@@ -8,7 +8,9 @@
 #include "chime.h"
 #include "ext.h"
 #include "focus.h"
+#include "guide.h"
 #include "kbd.h"
+#include "lang.h"
 #include "project.h"
 #include "mirror.h"
 #include "privacy.h"
@@ -49,7 +51,7 @@
 
 // What the face buttons do now (subscreen_set_button_legend), for the
 // Control screen's legend and the approval hint.
-static char legend_buttons[48] = "A enter  B delete  X esc  Y tab";
+static char legend_buttons[128] = "A enter  B delete  X esc  Y tab";
 static char legend_enter[8] = "A";
 static char legend_stop[8] = "START";
 static char legend_tab[8] = "Y";
@@ -62,11 +64,19 @@ static uint16_t *sub;
 static int sub_bg_id;
 static int sub_shake_y;
 static int composer_active;
+static int composer_add_quick;
+static int voice_ready;
+static int voice_recording;
+static int voice_latched;
+static int voice_waiting;
+static unsigned voice_bars;
 static int quick_active;
 static int quick_level;
 static int quick_selected;
 static int quick_top;
 static const quick_commands_t *quick_cmds;
+static const quick_saved_t *quick_saved_cmds;
+static int quick_remove_armed;
 static const quick_recent_t *quick_recent;
 // Whether this card has a camera (a DSi): QUICK's PHOTO row exists only
 // where there is a sensor behind it.
@@ -133,6 +143,28 @@ static void glyph_px(int x, int y, uint8_t glyph, uint16_t fg, uint16_t bg)
     mirror_glyph_px(&sub_mirror, x, y, glyph, fg, bg);
 }
 
+// One character (ASCII, raw extended wire glyph 0x80..0xBF, or UTF-8
+// codepoint >= 0x80 from the UI glyph atlas) at pixel (x, y).  Returns the
+// pixel width drawn (6 for narrow, 12 for wide CJK/Kana).
+static int next_char_px(const char **p, int x, int y, uint16_t fg, uint16_t bg)
+{
+    const uint8_t b0 = (uint8_t)**p;
+    if (b0 >= 0x80 && b0 < 0xC0) {
+        (*p)++;
+        glyph_px(x, y, b0, fg, bg);
+        return 6;
+    }
+    const uint32_t cp = lang_utf8_next(p);
+    if (cp <= 0x7E) {
+        glyph_px(x, y, (uint8_t)cp, fg, bg);
+        return 6;
+    }
+    const int w = render_unicode_into(sub, SUB_W, x, y, cp, fg, bg);
+    mirror_glyph_px(&sub_mirror, x, y, '?', fg, bg);
+    if (w > 6) mirror_glyph_px(&sub_mirror, x + 6, y, '?', fg, bg);
+    return w;
+}
+
 // A filled rectangle, likewise.
 static void fill_px(int x, int y, int w, int h, uint16_t colour)
 {
@@ -154,9 +186,18 @@ static void paint_char(int row, int col, uint8_t glyph, uint8_t fg)
 // stale glyphs from the previous frame on the row.
 static void draw_line(int row, const char *s, uint8_t fg)
 {
-    s = privacy_text(s);
+    const char *p = privacy_text(s);
+    const uint16_t fgc = render_palette_rgb(fg);
+    const uint16_t bgc = render_palette_rgb(PAL_BLACK);
     int col = 0;
-    for (; col < LOG_COLS && s[col]; col++) paint_char(row, col, (uint8_t)s[col], fg);
+    while (col < LOG_COLS && *p) {
+        if ((uint8_t)*p < 0x80) {
+            paint_char(row, col++, (uint8_t)*p++, fg);
+            continue;
+        }
+        const int w = next_char_px(&p, col * 6, row * 8, fgc, bgc);
+        col += w > 6 ? 2 : 1;
+    }
     for (; col < LOG_COLS; col++) paint_char(row, col, ' ', fg);
 }
 
@@ -166,30 +207,88 @@ static void draw_line(int row, const char *s, uint8_t fg)
 static void draw_line_split(int row, const char *s, uint8_t fg,
                             unsigned split, uint8_t fg2)
 {
-    s = privacy_text(s);
+    const char *p = privacy_text(s);
+    const uint16_t bgc = render_palette_rgb(PAL_BLACK);
     int col = 0;
-    for (; col < LOG_COLS && s[col]; col++) {
-        paint_char(row, col, (uint8_t)s[col],
-                   (unsigned)col >= split ? fg2 : fg);
+    while (col < LOG_COLS && *p) {
+        const uint8_t cur_fg = (unsigned)col >= split ? fg2 : fg;
+        if ((uint8_t)*p < 0x80) {
+            paint_char(row, col++, (uint8_t)*p++, cur_fg);
+            continue;
+        }
+        const int w = next_char_px(&p, col * 6, row * 8,
+                                   render_palette_rgb(cur_fg), bgc);
+        col += w > 6 ? 2 : 1;
     }
     for (; col < LOG_COLS; col++) paint_char(row, col, ' ', fg);
+}
+
+// Whether `s` has a glyph taller than the 8-row text line: the CJK atlas's
+// are ten rows (ink in the lower nine), so a line holding one needs one more
+// pixel row below it than the 8-pixel grid gives, and two such lines stacked
+// on adjacent rows run into each other.  Latin, accented Latin and the wire
+// glyphs are all eight rows.
+static int text_tall(const char *s)
+{
+    const char *p = s ? s : "";
+    while (*p) {
+        const uint8_t b0 = (uint8_t)*p;
+        if (b0 < 0xC0) {            // ASCII, or a raw wire glyph
+            p++;
+            continue;
+        }
+        if (lang_cp_is_wide(lang_utf8_next(&p))) return 1;
+    }
+    return 0;
+}
+
+// The pitch for lines stacked one under another: the 8-pixel grid, or ten
+// pixels -- nine of glyph and one clear -- when any of them is tall.  English
+// never takes the second branch, so its pixels stay on the grid.
+#define TALL_PITCH 10
+
+// A full-width line at pixel row `y` rather than on the 8-pixel grid, in an
+// arbitrary colour: for the lines that move off the grid when they are tall.
+static void draw_line_at(int y, const char *s, uint16_t fg)
+{
+    const char *p = privacy_text(s);
+    int col = 0;
+    while (col < LOG_COLS && *p) {
+        const int w = next_char_px(&p, col * 6, y, fg, SUB_BG);
+        col += w > 6 ? 2 : 1;
+    }
+    for (; col < LOG_COLS; col++) glyph_px(col * 6, y, ' ', fg, SUB_BG);
 }
 
 // A selected row needs a fill, not merely orange letters: on a dim panel an
 // outline disappears among terminal text.  This stays cell-aligned so the
 // same 42-column clipping rule as draw_line() applies to every session name.
-static void draw_selected_line(int row, const char *s, int selected)
+static void draw_selected_px(int y, const char *s, int selected)
 {
     const uint16_t bg = selected ? render_palette_rgb(PAL_ORANGE) : SUB_BG;
     const uint8_t fg = selected ? PAL_BLACK : PAL_DEFAULT;
+    const uint16_t fgc = render_palette_rgb(fg);
     const char *p = s ? privacy_text(s) : "";
-    for (int col = 0; col < LOG_COLS; col++) {
-        const uint8_t glyph = *p ? (uint8_t)*p++ : (uint8_t)' ';
-        // render_cell_into takes a palette attribute, not a raw background;
-        // draw the glyph directly so the selected orange field is exact.
-        glyph_px(col * 6, row * 8, glyph,
-                          render_palette_rgb(fg), bg);
+    // A CJK glyph's cell is ten rows, one above and one below the line's
+    // eight (render_unicode_into), and its lowest row is ink: a bar of eight
+    // would leave that row black on black.  The bar takes the glyph's cell.
+    if (selected && text_tall(p)) {
+        if (y > 0) fill_px(0, y - 1, LOG_COLS * 6, 1, bg);
+        if (y + 8 < LOG_ROWS * 8) fill_px(0, y + 8, LOG_COLS * 6, 1, bg);
     }
+    int col = 0;
+    while (col < LOG_COLS && *p) {
+        const int w = next_char_px(&p, col * 6, y, fgc, bg);
+        col += w > 6 ? 2 : 1;
+    }
+    for (; col < LOG_COLS; col++) {
+        glyph_px(col * 6, y, ' ', fgc, bg);
+    }
+}
+
+static void draw_selected_line(int row, const char *s, int selected)
+{
+    draw_selected_px(row * 8, s, selected);
 }
 
 void subscreen_draw_line(int row, const char *s, uint8_t fg)
@@ -233,11 +332,19 @@ static void draw_tile(int x, int y, int w, int h, const char *label,
                                   : held ? KBD_TILE_HI : KBD_TILE;
     const uint16_t text = (focused || held) ? KBD_TEXT_HI : KBD_TEXT;
     fill_px(x, y, w, h, tile);
-    const int len = (int)strlen(label);
-    const int tx = x + (w - len * 6) / 2;
+    // Never wider than the tile: a label that does not fit is cut on a whole
+    // character rather than painted over the neighbour.  (Translations are
+    // written to fit -- tests/test_core.c measures them -- so this is the
+    // backstop for a custom .lang pack.)
+    char fit[96];
+    const int cols = (int)lang_pad_cols(label, 0u, (unsigned)(w >= 6 ? w / 6 : 1),
+                                        fit, sizeof(fit));
+    int tx = x + (w - cols * 6) / 2;
     const int ty = y + (h - 8) / 2;
-    for (int i = 0; i < len; i++)
-        glyph_px(tx + i * 6, ty, (uint8_t)label[i], text, tile);
+    const char *p = fit;
+    while (*p) {
+        tx += next_char_px(&p, tx, ty, text, tile);
+    }
 }
 
 // A Control tile: the destination in capitals and, under it, what it is for
@@ -247,8 +354,9 @@ static void draw_tile(int x, int y, int w, int h, const char *label,
 static void draw_text_px(int x, int y, const char *text, uint16_t fg,
                          uint16_t bg)
 {
-    for (int i = 0; text[i]; i++) {
-        glyph_px(x + i * 6, y, (uint8_t)text[i], fg, bg);
+    const char *p = text ? text : "";
+    while (*p) {
+        x += next_char_px(&p, x, y, fg, bg);
     }
 }
 
@@ -266,12 +374,16 @@ static void draw_tile2(int x, int y, int w, int h, const char *label,
     mirror_fill_px(&sub_mirror, x, y, w, h, tile);
     const int has_sub = sub_label && sub_label[0];
     const int ly = y + (h - 8) / 2 - (has_sub ? 5 : 0);
-    const int llen = (int)strlen(label);
-    draw_text_px(x + (w - llen * 6) / 2, ly, label,
+    // Both lines kept two pixels in from each side (draw_tile's backstop).
+    const unsigned max_cols = (unsigned)(w > 10 ? (w - 4) / 6 : 1);
+    char fit[96];
+    const int lcols = (int)lang_pad_cols(label, 0u, max_cols, fit, sizeof(fit));
+    draw_text_px(x + (w - lcols * 6) / 2, ly, fit,
                  lit ? KBD_TEXT_HI : KBD_TEXT, tile);
     if (has_sub) {
-        const int slen = (int)strlen(sub_label);
-        draw_text_px(x + (w - slen * 6) / 2, ly + 11, sub_label,
+        const int scols = (int)lang_pad_cols(sub_label, 0u, max_cols, fit,
+                                             sizeof(fit));
+        draw_text_px(x + (w - scols * 6) / 2, ly + 11, fit,
                      lit ? KBD_TEXT_HI : TILE_SUB, tile);
     }
 }
@@ -280,11 +392,11 @@ static void draw_tile2(int x, int y, int w, int h, const char *label,
 // has no entry for.
 static void draw_line_rgb(int row, const char *s, uint16_t fg)
 {
-    s = privacy_text(s);
+    const char *p = privacy_text(s);
     int col = 0;
-    for (; col < LOG_COLS && s[col]; col++) {
-        glyph_px(col * 6, row * 8, (uint8_t)s[col], fg,
-                          SUB_BG);
+    while (col < LOG_COLS && *p) {
+        const int w = next_char_px(&p, col * 6, row * 8, fg, SUB_BG);
+        col += w > 6 ? 2 : 1;
     }
     for (; col < LOG_COLS; col++) {
         glyph_px(col * 6, row * 8, ' ', fg, SUB_BG);
@@ -332,9 +444,9 @@ static void draw_project_screen(void)
                       i == project_action_highlight);
         }
         if (project_god_mode) {
-            draw_line(18, "GOD MODE: a tap runs it immediately", PAL_RED);
+            draw_line(18, tr(TR_PROJECT_DO_GOD), PAL_RED);
         } else {
-            draw_line(18, "a tap loads it; A sends", PAL_DEFAULT);
+            draw_line(18, tr(TR_PROJECT_DO_SAFE), PAL_DEFAULT);
         }
         // Never a silent cap: a truncated list that does not say so reads as
         // the whole list.
@@ -373,19 +485,23 @@ static void draw_settings_screen(void)
 {
     for (int row = 0; row <= 23; row++) draw_line(row, "", PAL_DEFAULT);
 
-    // The two tabs, on the line the page title used to have to itself, and
+    // The five tabs, on the line the page title used to have to itself, and
     // how to move between them.  The tab on screen is the highlighted row's.
     const unsigned tab = settings_row_tab((settings_row_t)settings_ui_shown.row);
+    int tabs_right = SETTINGS_TAB_X;
     for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
         int tx, ty, tw, th;
         if (!settings_tab_rect(t, &tx, &ty, &tw, &th)) continue;
         draw_tile(tx, ty, tw, th, settings_tab_label(t), t == tab, 0);
+        tabs_right = tx + tw;
     }
-    static const char hint[] = "L/R  X back";
+    static const char hint[] = "L/R";
     const int hint_x = SUB_W - 4 - (int)(sizeof(hint) - 1) * 6;
-    for (int c = 0; hint[c]; c++) {
-        glyph_px(hint_x + c * 6, 4, (uint8_t)hint[c],
-                          HINT_DIM, SUB_BG);
+    if (hint_x > tabs_right + 2) {
+        for (int c = 0; hint[c]; c++) {
+            glyph_px(hint_x + c * 6, 4, (uint8_t)hint[c],
+                              HINT_DIM, SUB_BG);
+        }
     }
 
     const unsigned scroll = settings_ui_shown.scroll;
@@ -398,14 +514,16 @@ static void draw_settings_screen(void)
 
         // The label is text on the background rather than a tile of its own:
         // it is not pressable, and drawing it as a button would say it was.
-        const char *label = settings_row_label(row);
-        for (int c = 0; label[c]; c++) {
-            glyph_px(x + c * 6, y + (h - 8) / 2,
-                              (uint8_t)label[c],
-                              render_palette_rgb(row_selected ? PAL_ORANGE
-                                                              : PAL_DEFAULT),
-                              SUB_BG);
-        }
+        // Cut to the option column, so a long label from a custom pack ends
+        // before the chips instead of running under them.
+        char label[96];
+        const int label_cols = (settings_row_option_x(row) - x - 6) / 6;
+        (void)lang_pad_cols(settings_row_label(row), 0u,
+                            (unsigned)(label_cols > 1 ? label_cols : 1),
+                            label, sizeof(label));
+        draw_text_px(x, y + (h - 8) / 2, label,
+                     render_palette_rgb(row_selected ? PAL_ORANGE : PAL_DEFAULT),
+                     SUB_BG);
 
         const unsigned count = settings_option_count(row);
         const unsigned current = settings_option_current(&settings_shown, row);
@@ -417,19 +535,10 @@ static void draw_settings_screen(void)
             // identical armed and unarmed is a button you press twice by
             // accident.
             const char *text = settings_option_label(row, o);
-            if ((row == SETTINGS_ROW_DEFAULTS || row == SETTINGS_ROW_BUTTONS_RESET) &&
+            if (row == SETTINGS_ROW_DEFAULTS &&
                 settings_ui_shown.reset_armed &&
                 settings_ui_shown.row == (unsigned)row) {
-                text = "SURE?";
-            }
-            // A fixed button's one chip is a label, not a switch: drawn flat
-            // in the hint colour, and never lit.
-            if (settings_row_fixed(row)) {
-                for (int c = 0; text[c]; c++) {
-                    glyph_px(cx + 5 + c * 6, cy + (ch - 8) / 2,
-                                      (uint8_t)text[c], HINT_DIM, SUB_BG);
-                }
-                continue;
+                text = tr(TR_SETTINGS_RESET_SURE);
             }
             // Two different kinds of highlight, because they mean two
             // different things: `held` marks the option that is *set*, and the
@@ -499,7 +608,7 @@ static void draw_status_screen(void)
     // button that vanishes is a button somebody looks for; one that is visibly
     // inert says the clipboard is empty, which is the fact they wanted.
     draw_tile(ax, ay, aw, ah,
-              clip_can_paste ? "LOAD INTO COMPOSER" : "NOTHING TO PASTE",
+              clip_can_paste ? tr(TR_STATUS_PASTE) : tr(TR_STATUS_NO_PASTE),
               0, 0);
 }
 
@@ -558,60 +667,141 @@ static void clear_keyboard_floor(void)
 #define QUICK_FIRST_LINE 3
 #define QUICK_LIST_FIRST_LINE 2
 
+// A title and a hint under it, on rows 0 and 1 -- or, when either is tall,
+// at y = 0 and y = TALL_PITCH, which still ends (y 18) above row 3.
+static void draw_head2(const char *title, const char *hint)
+{
+    if (!text_tall(title) && !text_tall(hint)) {
+        draw_line(0, title, PAL_ORANGE);
+        draw_line_rgb(1, hint, HINT_DIM);
+        return;
+    }
+    for (int line = 0; line <= 2; line++) draw_line(line, "", PAL_DEFAULT);
+    draw_line_at(0, title, render_palette_rgb(PAL_ORANGE));
+    draw_line_at(TALL_PITCH, hint, HINT_DIM);
+}
+
 static void draw_quick_main(void)
 {
-    draw_line(0, "QUICK   UP/DOWN choose   A do   X back", PAL_ORANGE);
-    draw_line_rgb(1, "COMMANDS and AGAIN open the composer", HINT_DIM);
     for (int line = 2; line < LOG_ROWS; line++) draw_line(line, "", PAL_DEFAULT);
-    for (int i = 0; i < (int)quick_row_count(quick_camera); i++) {
-        char row[LOG_COLS + 1];
+    draw_head2(tr(TR_QUICK_HEAD), tr(TR_QUICK_SUB));
+    const int n = (int)quick_row_count(quick_camera);
+    unsigned label_cols = 9u;
+    for (int i = 0; i < n; i++) {
+        const unsigned c = lang_display_cols(quick_row_label((quick_row_t)i));
+        if (c > label_cols) label_cols = c;
+    }
+    if (label_cols > 12u) label_cols = 12u;
+
+    for (int i = 0; i < n; i++) {
+        char lbl[48], note[96], row[176];
         const quick_row_t r = (quick_row_t)i;
+        (void)lang_pad_cols(quick_row_label(r), label_cols, label_cols,
+                            lbl, sizeof(lbl));
         if (r == QUICK_ROW_MODE) {
-            snprintf(row, sizeof(row), " %-9s %-8s A: next mode", quick_row_label(r),
-                     claude_mode[0] ? claude_mode : "--");
-        } else if (r == QUICK_ROW_COMMANDS && quick_cmds) {
-            snprintf(row, sizeof(row), " %-9s %-23s %2u", quick_row_label(r),
-                     quick_row_note(r), quick_cmds->count);
-        } else if (r == QUICK_ROW_AGAIN && quick_recent) {
-            snprintf(row, sizeof(row), " %-9s %-23s %2u", quick_row_label(r),
-                     quick_row_note(r), quick_recent->count);
+            char mode_col[16];
+            (void)lang_pad_cols(claude_mode[0] ? claude_mode : "--", 8u, 8u,
+                                mode_col, sizeof(mode_col));
+            const unsigned rem = 42u - 1u - label_cols - 1u - 8u - 1u;
+            (void)lang_pad_cols(quick_row_note(r), 0u, rem, note, sizeof(note));
+            snprintf(row, sizeof(row), " %s %s %s", lbl, mode_col, note);
+        } else if ((r == QUICK_ROW_COMMANDS && quick_cmds) ||
+                   (r == QUICK_ROW_AGAIN && quick_recent)) {
+            const unsigned cnt = (r == QUICK_ROW_COMMANDS)
+                                     ? (quick_cmds->count +
+                                        (quick_saved_cmds ? quick_saved_cmds->count : 0u))
+                                     : quick_recent->count;
+            const unsigned note_w = 42u - 1u - label_cols - 1u - 1u - 2u;
+            (void)lang_pad_cols(quick_row_note(r), note_w, note_w,
+                                note, sizeof(note));
+            snprintf(row, sizeof(row), " %s %s %2u", lbl, note, cnt);
         } else {
-            snprintf(row, sizeof(row), " %-9s %s", quick_row_label(r), quick_row_note(r));
+            const unsigned rem = 42u - 1u - label_cols - 1u;
+            (void)lang_pad_cols(quick_row_note(r), 0u, rem, note, sizeof(note));
+            snprintf(row, sizeof(row), " %s %s", lbl, note);
         }
         draw_selected_line(QUICK_FIRST_LINE + 2 * i, row, i == quick_selected);
     }
-    draw_line_rgb(LOG_ROWS - 1, "the tile shows Claude's mode", HINT_DIM);
+    // The last row's ninth pixel row would be y 192, off the panel: a tall
+    // footer goes up one.
+    const char *foot = tr(TR_QUICK_FOOT);
+    if (!text_tall(foot)) {
+        draw_line_rgb(LOG_ROWS - 1, foot, HINT_DIM);
+    } else {
+        draw_line_at(LOG_ROWS * 8 - 9, foot, HINT_DIM);
+    }
+}
+
+// Where COMMANDS' and AGAIN's list starts: row 2, or -- when the two header
+// lines are tall and need y 0..18 between them (draw_head2) -- four pixels
+// lower.  The list still ends (y 180) above the bottom of the panel.
+static int quick_list_y0(int level)
+{
+    const int commands = level == SUBSCREEN_QUICK_COMMANDS;
+    const int tall = commands
+        ? text_tall(tr(TR_QUICK_CMD_HEAD)) || text_tall(tr(TR_QUICK_CMD_SUB))
+        : text_tall(tr(TR_QUICK_AGAIN_HEAD)) || text_tall(tr(TR_QUICK_AGAIN_SUB));
+    return QUICK_LIST_FIRST_LINE * 8 + (tall ? 4 : 0);
 }
 
 static void draw_quick_list(void)
 {
     const int commands = quick_level == SUBSCREEN_QUICK_COMMANDS;
-    draw_line(0, commands ? "COMMANDS   A compose   X back"
-                          : "AGAIN   A compose   Y forget   X back", PAL_ORANGE);
-    draw_line_rgb(1, commands ? "built in, then this computer's own"
-                              : "what you sent lately, newest first", HINT_DIM);
-    const unsigned count = commands ? (quick_cmds ? quick_cmds->count : 0)
+    const unsigned count = commands ? quick_commands_total(quick_cmds, quick_saved_cmds)
                                     : (quick_recent ? quick_recent->count : 0);
+    quick_cmd_kind_t sel_kind = QUICK_CMD_NONE;
+    if (commands && quick_selected >= 0) {
+        sel_kind = quick_commands_entry(quick_cmds, quick_saved_cmds,
+                                        (unsigned)quick_selected, NULL, NULL);
+    }
     for (int line = QUICK_LIST_FIRST_LINE; line < LOG_ROWS; line++) {
-        const int index = quick_top + (line - QUICK_LIST_FIRST_LINE);
-        if (line - QUICK_LIST_FIRST_LINE >= SUBSCREEN_QUICK_LIST_ROWS ||
-            index < 0 || (unsigned)index >= count) {
-            draw_line(line, "", PAL_DEFAULT);
-            continue;
-        }
+        draw_line(line, "", PAL_DEFAULT);
+    }
+    if (commands) {
+        draw_head2(sel_kind == QUICK_CMD_SAVED
+                       ? (quick_remove_armed ? tr(TR_QUICK_CMD_HEAD_SURE)
+                                             : tr(TR_QUICK_CMD_HEAD_SAVED))
+                       : sel_kind == QUICK_CMD_ADD ? tr(TR_QUICK_CMD_HEAD_ADD)
+                                                   : tr(TR_QUICK_CMD_HEAD),
+                   tr(TR_QUICK_CMD_SUB));
+    } else {
+        draw_head2(tr(TR_QUICK_AGAIN_HEAD), tr(TR_QUICK_AGAIN_SUB));
+    }
+    const int y0 = quick_list_y0(quick_level);
+    // Bottom to top: a tall glyph's lowest row is the next line's first, so
+    // the line under it has to be painted before it, not after.
+    for (int i = SUBSCREEN_QUICK_LIST_ROWS - 1; i >= 0; i--) {
+        const int index = quick_top + i;
+        if (index < 0 || (unsigned)index >= count) continue;
         char row[LOG_COLS + 1];
         if (commands) {
-            snprintf(row, sizeof(row), " %s", quick_cmds->names[index]);
+            const char *entry = "";
+            (void)quick_commands_entry(quick_cmds, quick_saved_cmds,
+                                       (unsigned)index, &entry, NULL);
+            char text[LOG_COLS];
+            quick_recent_row(entry, text, LOG_COLS - 2);
+            snprintf(row, sizeof(row), " %s", text);
         } else {
             char text[LOG_COLS];
             quick_recent_row(quick_recent->items[index], text, LOG_COLS - 2);
             snprintf(row, sizeof(row), " %s", text);
         }
-        draw_selected_line(line, row, index == quick_selected);
+        draw_selected_px(y0 + 8 * i, row, index == quick_selected);
     }
     if (!commands && count == 0) {
-        draw_line(QUICK_LIST_FIRST_LINE + 1, " Nothing yet: prompts you send", PAL_DEFAULT);
-        draw_line(QUICK_LIST_FIRST_LINE + 2, " from here land in this list.", PAL_DEFAULT);
+        const char *l0 = tr(TR_QUICK_AGAIN_EMPTY_0);
+        const char *l1 = tr(TR_QUICK_AGAIN_EMPTY_1);
+        const int pitch = text_tall(l0) || text_tall(l1) ? TALL_PITCH : 8;
+        char line[2][LOG_COLS * 3 + 2];
+        snprintf(line[0], sizeof(line[0]), " %s", l0);
+        snprintf(line[1], sizeof(line[1]), " %s", l1);
+        if (pitch == 8) {
+            draw_line(QUICK_LIST_FIRST_LINE + 1, line[0], PAL_DEFAULT);
+            draw_line(QUICK_LIST_FIRST_LINE + 2, line[1], PAL_DEFAULT);
+        } else {
+            draw_line_at(y0 + 8, line[0], render_palette_rgb(PAL_DEFAULT));
+            draw_line_at(y0 + 8 + pitch, line[1], render_palette_rgb(PAL_DEFAULT));
+        }
     }
 }
 
@@ -624,8 +814,10 @@ int subscreen_quick_row_at(int level, int top, int py)
             i >= (int)quick_row_count(quick_camera)) return -1;
         return i;
     }
-    const int row = line - QUICK_LIST_FIRST_LINE;
-    if (row < 0 || row >= SUBSCREEN_QUICK_LIST_ROWS) return -1;
+    const int y0 = quick_list_y0(level);
+    if (py < y0) return -1;
+    const int row = (py - y0) / 8;
+    if (row >= SUBSCREEN_QUICK_LIST_ROWS) return -1;
     return top + row;
 }
 
@@ -642,7 +834,7 @@ int subscreen_remote_row_at(int py)
 
 static void draw_remote_menu(void)
 {
-    draw_line(0, "REMOTE   UP/DOWN choose   A open   X back", PAL_ORANGE);
+    draw_line(0, tr(TR_REMOTE_HEAD), PAL_ORANGE);
     draw_line(1, remote_list && remote_list->note[0] ? remote_list->note : "",
               PAL_YELLOW);
     remote_row_t rows[REMOTE_ROWS_MAX];
@@ -681,21 +873,35 @@ static void draw_control_screen(void)
     // now.  RELINK sits at the right of rows 3 and 4, clear of all of it.
     draw_line(0, link, PAL_WHITE);
     draw_line(1, view, PAL_DEFAULT);
-    draw_line(2, chime_headline(), chime_needs_you() ? PAL_YELLOW : PAL_ORANGE);
-    // At most 30 columns: RELINK starts at column 31.
-    char confirm_hint[32];
-    snprintf(confirm_hint, sizeof(confirm_hint), "d-pad picks  %s confirms",
-             legend_enter[0] ? legend_enter : "A");
-    char rewind_hint[48];
-    snprintf(rewind_hint, sizeof(rewind_hint), "UNDO: d-pad picks  %s chooses",
-             legend_enter[0] ? legend_enter : "A");
+    const char *headline = chime_headline();
+    const uint8_t head_fg = chime_needs_you() ? PAL_YELLOW : PAL_ORANGE;
+    // At most 30 columns: RELINK starts at column 31.  Cut to that, on a
+    // whole character, so a long translation stops short of the tile
+    // instead of running underneath it.
+    char confirm_hint[96], rewind_hint[96], hint_fit[96];
+    (void)lang_fill(confirm_hint, sizeof(confirm_hint), tr(TR_CONTROL_HINT_CONFIRM),
+                    legend_enter[0] ? legend_enter : "A");
+    (void)lang_fill(rewind_hint, sizeof(rewind_hint), tr(TR_CONTROL_HINT_UNDO),
+                    legend_enter[0] ? legend_enter : "A");
     const char *hint =
-        focus_active() ? "d-pad moves  A opens  B out" :
+        focus_active() ? tr(TR_CONTROL_HINT_FOCUS) :
         rewind_on ? rewind_hint :
         chime_needs_you() ? confirm_hint :
-        "up/down scroll  hold down: now";
-    draw_line_rgb(3, hint, HINT_DIM);
-    draw_line(4, "", PAL_DEFAULT);
+        tr(TR_CONTROL_HINT_SCROLL);
+    (void)lang_pad_cols(hint, 0u, 30u, hint_fit, sizeof(hint_fit));
+    if (!text_tall(headline) && !text_tall(hint_fit)) {
+        draw_line(2, headline, head_fg);
+        draw_line_rgb(3, hint_fit, HINT_DIM);
+        draw_line(4, "", PAL_DEFAULT);
+    } else {
+        // Tall glyphs: the hint drops two pixels so the headline's lowest
+        // row (y 24) keeps a clear row under it.  It still ends (y 34)
+        // above the tiles at y 40.
+        draw_line(3, "", PAL_DEFAULT);
+        draw_line(4, "", PAL_DEFAULT);
+        draw_line(2, headline, head_fg);
+        draw_line_at(3 * 8 + 2, hint_fit, HINT_DIM);
+    }
     (void)ext_subscreen_draw(EXT_DRAW_CONTROL_STRIP);
 
     // Drawn from kbd.c's table, never from coordinates written here: the touch
@@ -707,26 +913,39 @@ static void draw_control_screen(void)
         kbd_control_rect((kbd_control_t)id, &x, &y, &w, &h);
         const char *label = "", *what = "";
         switch ((kbd_control_t)id) {
-        case KBD_CONTROL_KEYS:     label = "KEYS";     what = "type live";   break;
+        case KBD_CONTROL_KEYS:
+            label = tr(TR_CONTROL_KEYS);
+            what  = tr(TR_CONTROL_KEYS_SUB);
+            break;
         case KBD_CONTROL_QUICK: {
-            static char mode_what[24];
-            label = "QUICK";
+            static char mode_what[64];
+            label = tr(TR_CONTROL_QUICK);
             if (claude_mode[0]) {
-                snprintf(mode_what, sizeof(mode_what), "mode: %s", claude_mode);
+                (void)lang_fill(mode_what, sizeof(mode_what),
+                                tr(TR_CONTROL_QUICK_MODE), claude_mode);
                 what = mode_what;
             } else {
-                what = "mode, undo";
+                what = tr(TR_CONTROL_QUICK_SUB);
             }
             break;
         }
         case KBD_CONTROL_PHOTO:
             // The camera in one tap; a card without one gets QUICK's AGAIN.
-            label = quick_camera ? "PHOTO" : "AGAIN";
-            what = quick_camera ? "show Claude" : "your prompts";
+            label = quick_camera ? tr(TR_CONTROL_PHOTO) : tr(TR_CONTROL_AGAIN);
+            what  = quick_camera ? tr(TR_CONTROL_PHOTO_SUB) : tr(TR_CONTROL_AGAIN_SUB);
             break;
-        case KBD_CONTROL_COMPOSE:  label = "COMPOSE";  what = "write first"; break;
-        case KBD_CONTROL_REMOTE:   label = "REMOTE";   what = "elsewhere";   break;
-        case KBD_CONTROL_SETTINGS: label = "SETTINGS"; what = "sound, model"; break;
+        case KBD_CONTROL_COMPOSE:
+            label = tr(TR_CONTROL_COMPOSE);
+            what  = tr(TR_CONTROL_COMPOSE_SUB);
+            break;
+        case KBD_CONTROL_REMOTE:
+            label = tr(TR_CONTROL_REMOTE);
+            what  = tr(TR_CONTROL_REMOTE_SUB);
+            break;
+        case KBD_CONTROL_SETTINGS:
+            label = tr(TR_CONTROL_SETTINGS);
+            what  = tr(TR_CONTROL_SETTINGS_SUB);
+            break;
         default: break;
         }
         if (w <= 0) continue;
@@ -740,7 +959,7 @@ static void draw_control_screen(void)
     // an explicit relink is always one deliberate tap away when Wi-Fi stalls.
     int rx, ry, rw, rh;
     kbd_control_rect(KBD_CONTROL_RECONNECT, &rx, &ry, &rw, &rh);
-    draw_tile(rx, ry, rw, rh, "RELINK", 0, 0);
+    draw_tile(rx, ry, rw, rh, tr(TR_CONTROL_RELINK), 0, 0);
     // An extension's own small tile beside it, when there is one.
     kbd_control_rect(KBD_CONTROL_EXTENSION, &rx, &ry, &rw, &rh);
     if (rw > 0 && ext_control_label()) {
@@ -753,30 +972,377 @@ static void draw_control_screen(void)
     if (ext_control_label()) {
         for (int row = 20; row <= 23; row++) draw_line(row, "", PAL_DEFAULT);
     } else {
-        draw_line(20, "", PAL_DEFAULT);
         // From the BUTTONS tab, so the legend never names a button that
         // does something else now.
-        char second[LOG_COLS + 1];
+        char second[160];
         int at = 0;
         second[0] = '\0';
         if (legend_stop[0]) {
-            at += snprintf(second + at, sizeof(second) - (size_t)at, "%s stop  ",
-                           legend_stop);
+            at += snprintf(second + at, sizeof(second) - (size_t)at, "%s %s  ",
+                           legend_stop, tr(TR_BUTTON_STOP));
         }
         if (legend_tab[0] && at < (int)sizeof(second)) {
-            at += snprintf(second + at, sizeof(second) - (size_t)at, "R+%s mode  ",
-                           legend_tab);
+            at += snprintf(second + at, sizeof(second) - (size_t)at, "R+%s %s  ",
+                           legend_tab, tr(TR_LEGEND_MODE));
         }
         if (at < (int)sizeof(second)) {
-            snprintf(second + at, sizeof(second) - (size_t)at, "SELECT screens");
+            snprintf(second + at, sizeof(second) - (size_t)at, "SELECT %s",
+                     tr(TR_LEGEND_SCREENS));
         }
-        draw_line_rgb(21, legend_buttons, HINT_DIM);
-        draw_line_rgb(22, second, HINT_DIM);
-        draw_line_rgb(23, "L ctrl  R shift  L+R pick a tile", HINT_DIM);
+        const char *third = tr(TR_LEGEND_SHOULDERS);
+        // And where all of it, and every combo, is explained.
+        const char *fourth = tr(TR_LEGEND_GUIDE);
+        if (!text_tall(legend_buttons) && !text_tall(second) &&
+            !text_tall(third) && !text_tall(fourth)) {
+            draw_line_rgb(20, legend_buttons, HINT_DIM);
+            draw_line_rgb(21, second, HINT_DIM);
+            draw_line_rgb(22, third, HINT_DIM);
+            draw_line_rgb(23, fourth, HINT_DIM);
+        } else {
+            // Ten-pixel pitch from y 153: the tiles end at y 151 and the
+            // last line's ink ends at y 191, the panel's last row.
+            for (int row = 20; row <= 23; row++) draw_line(row, "", PAL_DEFAULT);
+            draw_line_at(153, legend_buttons, HINT_DIM);
+            draw_line_at(153 + TALL_PITCH, second, HINT_DIM);
+            draw_line_at(153 + 2 * TALL_PITCH, third, HINT_DIM);
+            draw_line_at(153 + 3 * TALL_PITCH, fourth, HINT_DIM);
+        }
     }
 }
 
-void subscreen_set_composer(int active) { composer_active = active ? 1 : 0; }
+// ------------------------------------------------------- CONTROLS guide ---
+//
+// The console in the person's hands, drawn in plain pixels: the lower half,
+// with the d-pad, A B X Y, START and SELECT where that model has them, and L
+// and R on its top edge.  Every button lights in the accent colour while it
+// is held.  The tabs, DONE and every label come from guide.c, which also
+// decides what each press means; this only draws.
+//
+// Drawn into a back buffer and copied out, so the console never flickers
+// through its own layers as a button lights and goes dark.
+
+static int guide_on;
+static guide_t guide_state_shown;
+static guide_config_t guide_cfg_shown;
+static button_map_t guide_map_shown;
+static console_family_t guide_family = CONSOLE_DSI;
+static unsigned guide_held;
+
+void subscreen_set_guide(int active, const guide_t *g, const guide_config_t *cfg,
+                         console_family_t family, unsigned held)
+{
+    guide_on = active && g && cfg;
+    if (!guide_on) return;
+    // Copies, not pointers: the caller's state can move on between this and
+    // the next paint without the drawing reading it halfway through.
+    guide_state_shown = *g;
+    guide_cfg_shown = *cfg;
+    if (cfg->map) guide_map_shown = *cfg->map;
+    else button_map_defaults(&guide_map_shown);
+    guide_cfg_shown.map = &guide_map_shown;
+    guide_family = guide_console(family);
+    guide_held = held;
+}
+
+static int isqrt_int(int v)
+{
+    if (v <= 0) return 0;
+    int r = 0;
+    while ((r + 1) * (r + 1) <= v) r++;
+    return r;
+}
+
+// A rectangle with rounded corners of radius `r`.
+static void fill_round(int x, int y, int w, int h, int r, uint16_t colour)
+{
+    if (r * 2 > h) r = h / 2;
+    if (r * 2 > w) r = w / 2;
+    for (int yy = 0; yy < h; yy++) {
+        int inset = 0;
+        const int d = yy < r ? r - yy : yy >= h - r ? yy - (h - r) + 1 : 0;
+        if (d > 0) inset = r - isqrt_int(r * r - d * d);
+        fill_px(x + inset, y + yy, w - 2 * inset, 1, colour);
+    }
+}
+
+static void fill_circle(int cx, int cy, int r, uint16_t colour)
+{
+    for (int dy = -r; dy <= r; dy++) {
+        const int half = isqrt_int(r * r - dy * dy);
+        fill_px(cx - half, cy + dy, 2 * half + 1, 1, colour);
+    }
+}
+
+// Text cut to `max_cols` and centred on `cx`.
+static void text_centre(int cx, int y, const char *s, unsigned max_cols,
+                        uint16_t fg, uint16_t bg)
+{
+    char fit[96];
+    const int cols = (int)lang_pad_cols(s ? s : "", 0u, max_cols, fit, sizeof(fit));
+    draw_text_px(cx - cols * 3, y, fit, fg, bg);
+}
+
+static void text_left(int x, int y, const char *s, unsigned max_cols,
+                      uint16_t fg, uint16_t bg)
+{
+    char fit[96];
+    (void)lang_pad_cols(s ? s : "", 0u, max_cols, fit, sizeof(fit));
+    draw_text_px(x, y, fit, fg, bg);
+}
+
+typedef struct {
+    uint16_t body, edge, shade, text, dim, shoulder;
+    int radius;
+    const char *name;
+} console_look_t;
+
+static console_look_t console_look(console_family_t f)
+{
+    console_look_t k;
+    k.shoulder = 0;
+    switch (f) {
+    case CONSOLE_DS:        // the original: silver, square, a hinge to match
+        k.body = ARGB16(1, 14, 14, 16); k.edge = ARGB16(1, 20, 20, 22);
+        k.shade = ARGB16(1, 9, 9, 11); k.text = ARGB16(1, 30, 30, 31);
+        k.dim = ARGB16(1, 22, 22, 24); k.radius = 5; k.name = "DS";
+        break;
+    case CONSOLE_DS_LITE:   // white and rounded
+        k.body = ARGB16(1, 25, 25, 26); k.edge = ARGB16(1, 30, 30, 31);
+        k.shade = ARGB16(1, 18, 18, 20); k.text = ARGB16(1, 3, 3, 4);
+        k.dim = ARGB16(1, 9, 9, 11); k.radius = 14; k.name = "DS Lite";
+        break;
+    case CONSOLE_3DS:       // dark blue-black, the circle pad, HOME
+        k.body = ARGB16(1, 5, 7, 12); k.edge = ARGB16(1, 9, 12, 19);
+        k.shade = ARGB16(1, 2, 3, 6); k.text = ARGB16(1, 26, 27, 29);
+        k.dim = ARGB16(1, 14, 15, 18); k.radius = 10; k.name = "3DS";
+        break;
+    case CONSOLE_DSI:
+    default:                // matte black, the power button at the front
+        k.body = ARGB16(1, 6, 6, 7); k.edge = ARGB16(1, 11, 11, 12);
+        k.shade = ARGB16(1, 3, 3, 3); k.text = ARGB16(1, 26, 27, 29);
+        k.dim = ARGB16(1, 14, 14, 15); k.radius = 8; k.name = "DSi";
+        break;
+    }
+    // Shoulders stand out from the body: lighter on a dark console, darker
+    // on the white one.
+    k.shoulder = f == CONSOLE_DS_LITE ? k.shade : k.edge;
+    return k;
+}
+
+#define GUIDE_BTN       ARGB16(1, 3, 3, 4)
+#define GUIDE_BTN_TEXT  ARGB16(1, 26, 26, 28)
+#define GUIDE_SCREEN_BG ARGB16(1, 1, 2, 4)
+
+// The body's box, and the drawn touch screen DONE sits in.
+#define GBODY_X 4
+#define GBODY_Y 24
+#define GBODY_W 248
+#define GBODY_H 144
+#define GSHOULDER_W 92
+#define GSCREEN_X 80
+#define GSCREEN_Y 36
+#define GSCREEN_W 96
+#define GSCREEN_H 72
+
+static void draw_face_button(int cx, int cy, char letter, int lit)
+{
+    const uint16_t accent = render_palette_rgb(PAL_ORANGE);
+    fill_circle(cx, cy, 6, lit ? accent : GUIDE_BTN);
+    glyph_px(cx - 2, cy - 3, (uint8_t)letter, lit ? KBD_TEXT_HI : GUIDE_BTN_TEXT,
+             lit ? accent : GUIDE_BTN);
+}
+
+static void draw_small_oval(int x, int y, int lit)
+{
+    fill_round(x, y, 14, 6, 3, lit ? render_palette_rgb(PAL_ORANGE) : GUIDE_BTN);
+}
+
+static void draw_dpad(int cx, int cy, int arm, int width, int lit_mask,
+                      uint16_t body)
+{
+    const uint16_t accent = render_palette_rgb(PAL_ORANGE);
+    const int hw = width / 2;
+    (void)body;
+    // The centre, then each arm on its own so a held direction lights alone.
+    fill_px(cx - hw, cy - hw, width, width, GUIDE_BTN);
+    fill_px(cx - hw, cy - hw - arm, width, arm,
+            (lit_mask & GUIDE_KEY_UP) ? accent : GUIDE_BTN);
+    fill_px(cx - hw, cy + hw + (width & 1), width, arm,
+            (lit_mask & GUIDE_KEY_DOWN) ? accent : GUIDE_BTN);
+    fill_px(cx - hw - arm, cy - hw, arm, width,
+            (lit_mask & GUIDE_KEY_LEFT) ? accent : GUIDE_BTN);
+    fill_px(cx + hw + (width & 1), cy - hw, arm, width,
+            (lit_mask & GUIDE_KEY_RIGHT) ? accent : GUIDE_BTN);
+}
+
+static void draw_shoulder(int x, int left, const char *letter, const char *label,
+                          int lit, const console_look_t *k)
+{
+    const uint16_t accent = render_palette_rgb(PAL_ORANGE);
+    const uint16_t fill = lit ? accent : k->shoulder;
+    const uint16_t fg = lit ? KBD_TEXT_HI : k->text;
+    fill_round(x, 16, GSHOULDER_W, 12, 5, fill);
+    char text[96];
+    snprintf(text, sizeof(text), "%s %s", letter, label);
+    (void)left;
+    text_centre(x + GSHOULDER_W / 2, 18, text, (GSHOULDER_W - 8) / 6, fg, fill);
+}
+
+static void draw_guide_screen(void)
+{
+    const guide_ctx_t ctx = guide_state_shown.ctx;
+    const guide_config_t *cfg = &guide_cfg_shown;
+    const unsigned held = guide_held;
+    const console_look_t k = console_look(guide_family);
+    const uint16_t accent = render_palette_rgb(PAL_ORANGE);
+
+    fill_px(0, 0, SUB_W, 192, SUB_BG);
+
+    // The contexts.  The one shown is lit like Settings' tab on screen.
+    for (int c = 0; c < GUIDE_CTX_COUNT; c++) {
+        int tx, ty, tw, th;
+        if (!guide_tab_rect((guide_ctx_t)c, cfg, &tx, &ty, &tw, &th)) continue;
+        draw_tile(tx, ty, tw, th, tr(guide_ctx_label((guide_ctx_t)c)),
+                  c == (int)ctx, 0);
+    }
+
+    // The body, its hinge edge, and the shoulders standing on it.
+    fill_round(GBODY_X, GBODY_Y, GBODY_W, GBODY_H, k.radius, k.edge);
+    fill_round(GBODY_X + 1, GBODY_Y + 1, GBODY_W - 2, GBODY_H - 2,
+               k.radius > 1 ? k.radius - 1 : 0, k.body);
+    if (guide_family == CONSOLE_DS) {
+        // The original's hinge: a darker bar across the top.
+        fill_px(GBODY_X + 6, GBODY_Y + 2, GBODY_W - 12, 5, k.shade);
+    }
+    draw_shoulder(GBODY_X + 4, 1, "L",
+                  guide_button_label(ctx, cfg, GUIDE_COMBO_L),
+                  (held & GUIDE_KEY_L) != 0, &k);
+    draw_shoulder(GBODY_X + GBODY_W - 4 - GSHOULDER_W, 0, "R",
+                  guide_button_label(ctx, cfg, GUIDE_COMBO_R),
+                  (held & GUIDE_KEY_R) != 0, &k);
+
+    // The touch screen, in its bezel: what to do, and DONE.
+    fill_px(GSCREEN_X - 3, GSCREEN_Y - 3, GSCREEN_W + 6, GSCREEN_H + 6, k.shade);
+    fill_px(GSCREEN_X, GSCREEN_Y, GSCREEN_W, GSCREEN_H, GUIDE_SCREEN_BG);
+    text_centre(GSCREEN_X + GSCREEN_W / 2, GSCREEN_Y + 8, tr(TR_GUIDE_PRESS),
+                16u, accent, GUIDE_SCREEN_BG);
+    text_centre(GSCREEN_X + GSCREEN_W / 2, GSCREEN_Y + 24, tr(TR_GUIDE_TABS_HINT),
+                16u, HINT_DIM, GUIDE_SCREEN_BG);
+    draw_tile(GUIDE_DONE_X, GUIDE_DONE_Y, GUIDE_DONE_W, GUIDE_DONE_H,
+              tr(TR_GUIDE_DONE), 0, 1);
+
+    // Left: the d-pad (and on a 3DS the circle pad above it, which is the
+    // same input in DSi mode, so it lights with it), and what it does here.
+    const unsigned dpad = held & GUIDE_KEY_DPAD;
+    int dpad_label_y;
+    if (guide_family == CONSOLE_3DS) {
+        fill_circle(40, 50, 13, k.shade);
+        fill_circle(40, 50, 10, dpad ? accent : GUIDE_BTN);
+        draw_dpad(40, 92, 9, 9, (int)dpad, k.body);
+        dpad_label_y = 110;
+    } else {
+        draw_dpad(40, 62, 11, 11, (int)dpad, k.body);
+        dpad_label_y = 84;
+    }
+    text_centre(40, dpad_label_y,
+                guide_button_label(ctx, cfg, GUIDE_COMBO_DPAD), 11u,
+                dpad ? accent : k.text, k.body);
+
+    // Right: A B X Y, and under them what each does here -- under the
+    // BUTTONS mapping on CONTROL and KEYS, read fresh on every paint.
+    const int fx = 214, fy = 54, off = 13;
+    draw_face_button(fx, fy - off, 'X', (held & GUIDE_KEY_X) != 0);
+    draw_face_button(fx - off, fy, 'Y', (held & GUIDE_KEY_Y) != 0);
+    draw_face_button(fx + off, fy, 'A', (held & GUIDE_KEY_A) != 0);
+    draw_face_button(fx, fy + off, 'B', (held & GUIDE_KEY_B) != 0);
+    static const struct { guide_combo_t combo; char letter; unsigned key; } FACES[] = {
+        { GUIDE_COMBO_X, 'X', GUIDE_KEY_X }, { GUIDE_COMBO_Y, 'Y', GUIDE_KEY_Y },
+        { GUIDE_COMBO_A, 'A', GUIDE_KEY_A }, { GUIDE_COMBO_B, 'B', GUIDE_KEY_B },
+    };
+    int ly = 78;
+    for (unsigned i = 0; i < sizeof(FACES) / sizeof(FACES[0]); i++) {
+        char line[96];
+        snprintf(line, sizeof(line), "%c %s", FACES[i].letter,
+                 guide_button_label(ctx, cfg, FACES[i].combo));
+        const char *label = guide_button_label(ctx, cfg, FACES[i].combo);
+        ly += text_tall(label) ? 11 : 9;
+        text_left(184, ly - 9, line, 11u,
+                  (held & FACES[i].key) ? accent : k.text, k.body);
+    }
+
+    // START and SELECT: beside the face buttons on a DS, DS Lite or DSi;
+    // under the screen, either side of HOME, on a 3DS.  Each is named as the
+    // console prints it, with what it does here on the line under.
+    const int start_lit = (held & GUIDE_KEY_START) != 0;
+    const int select_lit = (held & GUIDE_KEY_SELECT) != 0;
+    const int sy = ly + 3;
+    static const struct { const char *name; guide_combo_t combo; unsigned key; } SS[] = {
+        { "START", GUIDE_COMBO_START, GUIDE_KEY_START },
+        { "SELECT", GUIDE_COMBO_SELECT, GUIDE_KEY_SELECT },
+    };
+    for (unsigned i = 0; i < 2; i++) {
+        const int lit = (held & SS[i].key) != 0;
+        const int y = sy + (int)i * 22;
+        text_left(184, y, SS[i].name, 6u, lit ? accent : k.dim, k.body);
+        const char *label = guide_button_label(ctx, cfg, SS[i].combo);
+        text_left(190, y + (text_tall(label) ? 10 : 9), label, 10u,
+                  lit ? accent : k.text, k.body);
+        if (guide_family != CONSOLE_3DS) draw_small_oval(232, y + 1, lit);
+    }
+    if (guide_family == CONSOLE_3DS) {
+        draw_small_oval(100, 118, select_lit);
+        fill_circle(128, 121, 4, k.shade);
+        draw_small_oval(142, 118, start_lit);
+        text_centre(107, 128, "SELECT", 6u, select_lit ? accent : k.dim, k.body);
+        text_centre(149, 128, "START", 5u, start_lit ? accent : k.dim, k.body);
+    }
+    if (guide_family == CONSOLE_DSI) {
+        // The DSi's power button, bottom left on the front.
+        fill_circle(GBODY_X + 14, GBODY_Y + GBODY_H - 14, 4, k.shade);
+    }
+    // Which console this is drawn as.
+    text_left(GBODY_X + 10, GBODY_Y + GBODY_H - 30, k.name, 8u, k.dim, k.body);
+
+    // How to leave, under the console.
+    text_centre(SUB_W / 2, GBODY_Y + GBODY_H + 6, tr(TR_GUIDE_FOOT), 42u,
+                HINT_DIM, SUB_BG);
+}
+
+// Paints the guide into a back buffer and copies it out in one pass.
+static void draw_guide(void)
+{
+    static uint16_t back[SUB_W * 192];
+    uint16_t *const front = sub;
+    sub = back;
+    draw_guide_screen();
+    sub = front;
+    for (int i = 0; i < SUB_W * 192; i++) sub[i] = back[i];
+}
+
+void subscreen_set_composer(int active)
+{
+    composer_active = active ? 1 : 0;
+    if (!composer_active) composer_add_quick = 0;
+}
+
+void subscreen_set_composer_add_quick(int add_quick)
+{
+    composer_add_quick = add_quick ? 1 : 0;
+}
+
+void subscreen_set_voice(int ready, int recording, int waiting, unsigned bars)
+{
+    voice_ready = ready ? 1 : 0;
+    voice_recording = recording ? 1 : 0;
+    if (!voice_recording) voice_latched = 0;
+    voice_waiting = waiting ? 1 : 0;
+    voice_bars = bars > 8u ? 8u : bars;
+}
+
+void subscreen_set_voice_latched(int latched)
+{
+    voice_latched = (latched && voice_recording) ? 1 : 0;
+}
 
 static int boot_active;
 static int boot_keyboard;
@@ -834,6 +1400,12 @@ void subscreen_set_quick(int active, int level, int selected, int top,
     quick_top = top;
     quick_cmds = commands;
     quick_recent = recent;
+}
+
+void subscreen_set_quick_saved(const quick_saved_t *saved, int remove_armed)
+{
+    quick_saved_cmds = saved;
+    quick_remove_armed = remove_armed ? 1 : 0;
 }
 
 void subscreen_set_rewind(int picking) { rewind_on = picking ? 1 : 0; }
@@ -946,7 +1518,8 @@ void subscreen_update(unsigned long rx, unsigned long msgs, unsigned long tx,
     //
     // If a layout leaves debris after this, that layout's draw path is
     // incomplete. Fix the path rather than going back to clearing every frame.
-    const int layout = boot_active ? (boot_keyboard ? -5 : -4) :
+    const int layout = guide_on ? -8 :
+                       boot_active ? (boot_keyboard ? -5 : -4) :
                        composer_active ? -1 : camera_active ? -7 :
                        quick_active ? -2 :
                        remote_active ? -6 :
@@ -961,7 +1534,10 @@ void subscreen_update(unsigned long rx, unsigned long msgs, unsigned long tx,
     char line1[LOG_COLS + 1], line2[LOG_COLS + 1];
     status_format_counters(rx, msgs, tx, loops, raw, lib, line1, line2);
 
-    if (boot_active) {
+    if (guide_on) {
+        // Above everything it can be opened over: QUICK, Settings, a menu.
+        draw_guide();
+    } else if (boot_active) {
         draw_line(0, boot_head[0], PAL_ORANGE);
         draw_line(1, boot_head[1], PAL_DEFAULT);
         if (boot_keyboard) {
@@ -974,11 +1550,99 @@ void subscreen_update(unsigned long rx, unsigned long msgs, unsigned long tx,
             draw_log_region(2, LOG_ROWS - 1);
         }
     } else if (composer_active) {
-        draw_line(0, "COMPOSE: nothing is sent until you press A", PAL_YELLOW);
-        draw_line(1, "A sends   B deletes   X cancels", PAL_DEFAULT);
+        const char *head;
+        const char *keys;
+        uint8_t head_fg;
+        // The level, as eight columns of '#' padded with spaces, goes into
+        // the language's line; lang_fill() reads only its one %s, so a
+        // custom pack's text is never a printf format.
+        char meter[LOG_COLS * 3 + 1];
+        if (voice_recording) {
+            head = voice_latched ? tr(TR_COMPOSE_MIC_LATCH) : tr(TR_COMPOSE_MIC_REC);
+            head_fg = PAL_RED;
+            char bars[9];
+            snprintf(bars, sizeof(bars), "%-8.*s", (int)voice_bars, "########");
+            lang_fill(meter, sizeof(meter),
+                      tr(voice_latched ? TR_COMPOSE_METER_LATCHED
+                         : settings_shown.mic_mode == SETTINGS_MIC_LATCH
+                             ? TR_COMPOSE_METER_LATCH
+                             : TR_COMPOSE_METER_HOLD),
+                      bars);
+            keys = meter;
+        } else if (voice_waiting) {
+            head = tr(TR_COMPOSE_MIC_WAIT);
+            head_fg = PAL_ORANGE;
+            keys = tr(TR_COMPOSE_KEYS);
+        } else if (focus_active() && focus_place() == FOCUS_KEYS) {
+            // Focus moves A to typing the lit key, so the lines that say
+            // what A does change with it: START sends (or saves).
+            head = tr(TR_COMPOSE_FOCUS_HEAD);
+            head_fg = PAL_ORANGE;
+            keys = tr(composer_add_quick ? TR_COMPOSE_ADD_FOCUS_KEYS
+                                         : TR_COMPOSE_FOCUS_KEYS);
+        } else if (composer_add_quick) {
+            head = tr(TR_COMPOSE_ADD_HEAD);
+            head_fg = PAL_YELLOW;
+            keys = tr(TR_COMPOSE_ADD_KEYS);
+        } else {
+            head = tr(TR_COMPOSE_HEAD);
+            head_fg = PAL_YELLOW;
+            keys = tr(TR_COMPOSE_KEYS);
+        }
+        // The two lines above the keyboard have its 20 pixels.  On the grid,
+        // a tall (CJK) glyph's cell -- a row above and a row below the eight
+        // -- ran into its neighbour: the second line painted over the first
+        // one's lowest row, and the first's leftovers showed past the end of
+        // a short second line.  Tall, they move off the grid to y 1 and 11,
+        // each glyph's ten rows clear of the other's and of the keys at 20.
+        if (!text_tall(head) && !text_tall(keys)) {
+            draw_line(0, head, head_fg);
+            draw_line(1, keys, PAL_DEFAULT);
+        } else {
+            fill_px(0, 0, LOG_COLS * 6, KBD_ORIGIN_Y, SUB_BG);
+            draw_line_at(1, head, render_palette_rgb(head_fg));
+            draw_line_at(1 + TALL_PITCH, keys, render_palette_rgb(PAL_DEFAULT));
+        }
         draw_keyboard();
-        draw_line(20, "ENT adds a new line", PAL_DEFAULT);
-        draw_line(21, "Y: snippets (and clipboard, if on)", PAL_DEFAULT);
+        // The two rows under the keyboard teach what the keyboard cannot
+        // show: ENT and Y, then the shoulders -- L then R puts the d-pad on
+        // the keys, and holding R talks, offered only when the computer
+        // said it can transcribe.  (SELECT+START is not here: the guide
+        // does not open over the composer, whose keys it would shadow.)
+        {
+            char shoulders[160];
+            if (voice_ready) {
+                snprintf(shoulders, sizeof(shoulders), "%s   %s",
+                         tr(TR_COMPOSE_HINT_FOCUS), tr(TR_COMPOSE_HINT_TALK));
+            } else {
+                snprintf(shoulders, sizeof(shoulders), "%s",
+                         tr(TR_COMPOSE_HINT_FOCUS));
+            }
+            const char *edit = tr(TR_COMPOSE_HINT_EDIT);
+            if (!text_tall(edit) && !text_tall(shoulders)) {
+                draw_line(20, edit, PAL_DEFAULT);
+                draw_line(21, shoulders, PAL_DEFAULT);
+            } else {
+                // Tall glyphs need ten pixels a line: rows 20 and 21 are
+                // y 160..175, and the second line still ends above the MIC
+                // bar at y 176.
+                draw_line(20, "", PAL_DEFAULT);
+                draw_line(21, "", PAL_DEFAULT);
+                draw_line_at(20 * 8 - 3, edit, render_palette_rgb(PAL_DEFAULT));
+                draw_line_at(20 * 8 + 7, shoulders, render_palette_rgb(PAL_DEFAULT));
+            }
+        }
+        // Rows 22-23 are the MIC bar's, or nothing: blank them either way.
+        draw_line(22, "", PAL_DEFAULT);
+        draw_line(23, "", PAL_DEFAULT);
+        if (voice_ready || voice_recording || voice_waiting) {
+            draw_tile(VOICE_BAR_X, VOICE_BAR_Y, VOICE_BAR_W, VOICE_BAR_H,
+                      voice_recording ? (voice_latched ? tr(TR_COMPOSE_MIC_LATCH)
+                                                       : tr(TR_COMPOSE_MIC_REC)) :
+                      voice_waiting ? tr(TR_COMPOSE_MIC_WAIT) :
+                      tr(TR_COMPOSE_MIC_IDLE),
+                      voice_recording, voice_recording);
+        }
     } else if (camera_active) {
         // The strips only -- the rows between them are the viewfinder's and
         // belong to subscreen_camera_blit(), which is why a repaint here
@@ -1026,9 +1690,9 @@ void subscreen_update(unsigned long rx, unsigned long msgs, unsigned long tx,
         // Without an extension standing there, the floor says what the
         // keyboard's own special keys do -- the two that are not obvious.
         if (!ext_control_label()) {
-            draw_line_rgb(KBD_FLOOR_ROW, "Every key goes straight to Claude.",
+            draw_line_rgb(KBD_FLOOR_ROW, tr(TR_KEYS_FLOOR_0),
                           HINT_DIM);
-            draw_line_rgb(KBD_FLOOR_ROW + 1, "SHFT: abc ABC !@#   X: back",
+            draw_line_rgb(KBD_FLOOR_ROW + 1, tr(TR_KEYS_FLOOR_1),
                           HINT_DIM);
         }
     } else {

@@ -22,6 +22,7 @@
 #include <stdint.h>
 
 #include "clip.h"
+#include "guide.h"
 #include "project.h"
 #include "settings.h"
 #include "mirror.h"
@@ -43,6 +44,9 @@ void subscreen_update(unsigned long rx, unsigned long msgs, unsigned long tx,
 // EDIT: leaving the ordinary keyboard there would put live PTY keys one touch
 // away from a prompt the user is still reading.
 void subscreen_set_composer(int active);
+void subscreen_set_composer_add_quick(int add_quick);
+void subscreen_set_voice(int ready, int recording, int waiting, unsigned bars);
+void subscreen_set_voice_latched(int latched);
 
 // The boot menu's lower screen: two header lines (what this step is, and
 // what the buttons do), then either the touch keyboard -- while a field is
@@ -80,6 +84,7 @@ int subscreen_remote_row_at(int py);
 void subscreen_set_quick(int active, int level, int selected, int top,
                          const quick_commands_t *commands,
                          const quick_recent_t *recent);
+void subscreen_set_quick_saved(const quick_saved_t *saved, int remove_armed);
 // Claude's mode as QUICK last read it ("" while unknown): on the tile, and on
 // the MODE row.
 void subscreen_set_claude_mode(const char *mode);
@@ -139,6 +144,12 @@ void subscreen_set_settings(const settings_t *settings,
 // moves this whole panel by `offset_y` and 0 puts it back.  A landing shakes
 // the screen it landed on, so only one of the two is ever moving.
 void subscreen_set_shake(int offset_y);
+
+// The controls guide (guide.h) owns the whole bottom screen while `active`:
+// the tabs, the drawn console with `held` lit, and DONE.  Copied, so the
+// caller's state may move on before the next paint.
+void subscreen_set_guide(int active, const guide_t *g, const guide_config_t *cfg,
+                         console_family_t family, unsigned held);
 
 // Three ways to put a finished 42-column line on the panel, for anything
 // that draws through ext.h: a plain row, a row in two colours split at a

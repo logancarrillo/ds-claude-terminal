@@ -1,6 +1,8 @@
 #ifndef DSTERM_CHIME_H
 #define DSTERM_CHIME_H
 
+#include <stddef.h>
+
 // The chime is a reading of observable client facts, not a claim about an
 // unseen model.  It knows that a line left this device, cells changed, a
 // session announced new output, or the link changed.  It does not know who is
@@ -48,6 +50,13 @@ void chime_init(void);
 void chime_set_answer_buttons(const char *yes, const char *no);
 void chime_tick(void);                    // once per frame
 void chime_sent(void);                    // a line was submitted (a CR sent)
+// Every key sequence sent to the session passes through here first. Returns 1
+// when it is a submission: a lone Enter after something was typed on the
+// line, or one answering a question Claude asked (chime_needs_you). An Enter
+// on an empty line is still sent -- Claude uses it to pick menu items -- but
+// it is not a prompt, so it must not sound SENT or start the thinking arc:
+// pressing A a few times on nothing played a whole "request" that never was.
+int chime_typed(const char *bytes, size_t n);
 void chime_cells(unsigned char glyph);    // screen cells changed (once per message)
 void chime_view_sent(void);               // a user-initiated resync is coming
 void chime_history(int scrolled_back);    // the view is scrolled into history

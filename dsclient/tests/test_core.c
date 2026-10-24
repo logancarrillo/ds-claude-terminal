@@ -26,8 +26,10 @@
 #include "../source/clip.h"
 #include "../source/composer.h"
 #include "../source/focus.h"
+#include "../source/font.h"
 #include "../source/kbd.h"
 #include "../source/keys.h"
+#include "../source/lang.h"
 #include "../source/log.h"
 #include "../source/project.h"
 #include "../source/proto.h"
@@ -40,6 +42,9 @@
 #include "../source/snippets.h"
 #include "../source/sound.h"
 #include "../source/status.h"
+#include "../source/ui_font.h"
+#include "../source/voice.h"
+#include "../source/guide.h"
 #include "check.h"
 #include "support.h"
 
@@ -688,7 +693,9 @@ static unsigned settings_test_scroll(settings_row_t row)
 {
     unsigned index = 0;
     for (int i = 0; i < (int)row; i++) {
-        if ((settings_row_t)i == SETTINGS_ROW_SHUTTER &&
+        if (((settings_row_t)i == SETTINGS_ROW_SHUTTER ||
+             (settings_row_t)i == SETTINGS_ROW_PICTURE ||
+             (settings_row_t)i == SETTINGS_ROW_LIVEVIEW) &&
             !settings_camera_available()) continue;   // an absent row takes no space
         if (settings_row_tab((settings_row_t)i) == settings_row_tab(row)) index++;
     }
@@ -722,8 +729,8 @@ static void test_buttons_and_their_tab(void)
     CHECK(strcmp(legend, "A space  B enter  X esc  Y tab") == 0, "legend: '%s'", legend);
     CHECK(strlen(legend) <= 42, "the legend does not fit a line");
 
-    // The tab: button rows set the map, refuse to drop Enter, fixed rows do
-    // nothing, and RESET puts the five back behind a confirm.
+    // The tab: button rows set the map, refuse to drop Enter, and DEFAULTS
+    // puts the buttons (and every other tab) back behind a confirm.
     settings_t st;
     settings_ui_t ui;
     settings_defaults(&st);
@@ -735,18 +742,13 @@ static void test_buttons_and_their_tab(void)
               SETTINGS_PRESS_NOTHING && ui.refused &&
               st.buttons.action[BUTTON_A] == BUTTON_ENTER,
           "taking Enter off A was not refused and said");
-    CHECK(settings_press(&st, &ui, SETTINGS_ROW_FIXED_SELECT, 0, NULL) ==
-              SETTINGS_PRESS_NOTHING && !ui.refused,
-          "a fixed button did something when pressed");
-    CHECK(settings_row_fixed(SETTINGS_ROW_FIXED_L) && !settings_row_fixed(SETTINGS_ROW_BUTTON_X),
-          "fixed rows are not told apart");
-    CHECK(settings_press(&st, &ui, SETTINGS_ROW_BUTTONS_RESET, 0, NULL) ==
+    CHECK(settings_press(&st, &ui, SETTINGS_ROW_DEFAULTS, 0, NULL) ==
               SETTINGS_PRESS_NOTHING && ui.reset_armed &&
               st.buttons.action[BUTTON_Y] == BUTTON_SPACE,
-          "RESET fired on the first press");
-    CHECK(settings_press(&st, &ui, SETTINGS_ROW_BUTTONS_RESET, 0, NULL) ==
-              SETTINGS_PRESS_CHANGED && st.buttons.action[BUTTON_Y] == BUTTON_TAB,
-          "RESET did not put the buttons back");
+          "DEFAULTS fired on the first press");
+    CHECK(settings_press(&st, &ui, SETTINGS_ROW_DEFAULTS, 0, NULL) ==
+              SETTINGS_PRESS_RESET && st.buttons.action[BUTTON_Y] == BUTTON_TAB,
+          "DEFAULTS did not put the buttons back");
 
     // The file: the map round-trips, and a map with no Enter is refused.
     char err[64];
@@ -760,22 +762,28 @@ static void test_buttons_and_their_tab(void)
               back.buttons.action[BUTTON_X] == BUTTON_STOP,
           "the button map did not survive a save: %s", err);
     remove(path);
-    CHECK(!settings_parse("version=4\nbutton_a=space\n", &back, err, sizeof(err)),
-          "a file with no button on Enter was accepted");
+    // No button left on Enter: the buttons go back to their defaults, and
+    // only the buttons.
+    CHECK(settings_parse("version=4\nbutton_a=space\ntheme=sea\n", &back, err,
+                         sizeof(err)) &&
+              back.buttons.action[BUTTON_A] == BUTTON_ENTER &&
+              back.theme == SETTINGS_THEME_SEA,
+          "a file with no button on Enter cost more than the buttons: %s", err);
     CHECK(settings_parse("version=4\nBUTTON_A=enter\nbutton_b=space\n", &back, err,
                          sizeof(err)) &&
               back.buttons.action[BUTTON_B] == BUTTON_SPACE,
           "a button key in capitals was not read: %s", err);
 
-    // Scrolling: BUTTONS is longer than the screen.  Walking down keeps the
-    // highlight on screen, the arrows say there is more, and wrapping goes
-    // back to the top.
+    // Every tab fits on one screen without scrolling: walking down BUTTONS
+    // keeps every row in view with scroll == 0 and wraps back to the top.
     settings_ui_init(&ui);
     settings_ui_tab(&st, &ui, SETTINGS_TAB_BUTTONS);
-    CHECK(settings_tab_rows(SETTINGS_TAB_BUTTONS) > SETTINGS_VISIBLE_ROWS,
-          "BUTTONS fits the screen; nothing here exercises scrolling");
+    for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
+        CHECK(settings_tab_rows(t) <= SETTINGS_VISIBLE_ROWS,
+              "tab %u has %u rows and needs scrolling", t, settings_tab_rows(t));
+    }
     CHECK(ui.scroll == 0 && !settings_more_above(0) &&
-              settings_more_below(SETTINGS_TAB_BUTTONS, 0),
+              !settings_more_below(SETTINGS_TAB_BUTTONS, 0),
           "the arrows are wrong at the top of BUTTONS");
     for (unsigned i = 0; i + 1 < settings_tab_rows(SETTINGS_TAB_BUTTONS); i++) {
         settings_ui_move(&st, &ui, 0, 1);
@@ -783,12 +791,11 @@ static void test_buttons_and_their_tab(void)
         CHECK(settings_row_rect((settings_row_t)ui.row, ui.scroll, NULL, &y, NULL, NULL),
               "the highlight (row %u) scrolled out of view at scroll %u", ui.row, ui.scroll);
     }
-    CHECK(ui.row == SETTINGS_ROW_BUTTONS_RESET && ui.scroll > 0 &&
-              settings_more_above(ui.scroll) &&
+    CHECK(ui.row == SETTINGS_ROW_DEFAULTS && ui.scroll == 0 &&
               !settings_more_below(SETTINGS_TAB_BUTTONS, ui.scroll),
-          "the bottom of BUTTONS is not scrolled to");
-    CHECK(settings_scroll_hit(SETTINGS_TAB_BUTTONS, ui.scroll, 250, SETTINGS_ROW_Y + 4) == -1 &&
-              settings_scroll_hit(SETTINGS_TAB_BUTTONS, ui.scroll, 100, SETTINGS_ROW_Y + 4) == 0,
+          "the bottom of BUTTONS is not DEFAULTS");
+    CHECK(settings_scroll_hit(SETTINGS_TAB_BUTTONS, 1, 250, SETTINGS_ROW_Y + 4) == -1 &&
+              settings_scroll_hit(SETTINGS_TAB_BUTTONS, 1, 100, SETTINGS_ROW_Y + 4) == 0,
           "the up arrow is not where it is drawn");
     settings_ui_move(&st, &ui, 0, 1);
     CHECK(ui.row == SETTINGS_ROW_BUTTON_A && ui.scroll == 0,
@@ -825,29 +832,30 @@ static void test_shutter_setting(void)
     settings_set_camera_available(0);
     settings_defaults(&st);
     settings_ui_init(&ui);
-    CHECK(settings_tab_rows(SETTINGS_TAB_BUTTONS) == 10,
+    // A, B, X, Y, START, CONTROLS, DEFAULTS.
+    CHECK(settings_tab_rows(SETTINGS_TAB_BUTTONS) == 7,
           "a card with no camera grew a shutter row");
     int x = 0, y = 0, w = 0, h = 0;
     CHECK(!settings_row_rect(SETTINGS_ROW_SHUTTER, 0, &x, &y, &w, &h),
           "an absent row still had a rect");
     CHECK(settings_row_hit(SETTINGS_TAB_BUTTONS, 0, 100,
                            SETTINGS_ROW_Y + 5 * SETTINGS_ROW_PITCH) ==
-              SETTINGS_ROW_FIXED_SELECT,
+              SETTINGS_ROW_CONTROLS,
           "a touch where SHUTTER would be hit it anyway");
     CHECK(settings_press(&st, &ui, SETTINGS_ROW_SHUTTER, 1, NULL) ==
               SETTINGS_PRESS_NOTHING,
           "an absent row still took a press");
-    // Navigation skips it: walking down off START lands on SELECT.
+    // Navigation skips it: walking down off START lands on CONTROLS.
     settings_ui_tab(&st, &ui, SETTINGS_TAB_BUTTONS);
     ui.row = SETTINGS_ROW_BUTTON_START;
     settings_ui_move(&st, &ui, 0, 1);
-    CHECK(ui.row == SETTINGS_ROW_FIXED_SELECT,
+    CHECK(ui.row == SETTINGS_ROW_CONTROLS,
           "the absent shutter row was still in the walk");
 
     // A card with one (a DSi): the row exists, with three chips on screen.
     settings_set_camera_available(1);
     CHECK(settings_camera_available(), "the flag did not set");
-    CHECK(settings_tab_rows(SETTINGS_TAB_BUTTONS) == 11,
+    CHECK(settings_tab_rows(SETTINGS_TAB_BUTTONS) == 8,
           "BUTTONS did not grow the shutter row");
     CHECK(settings_row_rect(SETTINGS_ROW_SHUTTER, 0, &x, &y, &w, &h) &&
               x >= 0 && x + w <= 256 && y + h <= 160,
@@ -865,17 +873,12 @@ static void test_shutter_setting(void)
                            y + h / 2) == SETTINGS_ROW_SHUTTER,
           "a touch on the shutter row hit something else");
 
-    // The value, its press, and the two resets that must restore R.
+    // The value, its press, and DEFAULTS that must restore R.
     CHECK(settings_option_current(&st, SETTINGS_ROW_SHUTTER) == 0,
           "the default shutter is not R");
     CHECK(settings_press(&st, &ui, SETTINGS_ROW_SHUTTER, 1, NULL) ==
               SETTINGS_PRESS_CHANGED && st.camera_shutter == SHUTTER_L,
           "the shutter could not be set to L");
-    CHECK(settings_press(&st, &ui, SETTINGS_ROW_BUTTONS_RESET, 0, NULL) ==
-              SETTINGS_PRESS_NOTHING &&
-              settings_press(&st, &ui, SETTINGS_ROW_BUTTONS_RESET, 0, NULL) ==
-              SETTINGS_PRESS_CHANGED && st.camera_shutter == SHUTTER_R,
-          "BUTTONS reset did not put the shutter back to R");
     settings_press(&st, &ui, SETTINGS_ROW_SHUTTER, 2, NULL);
     CHECK(settings_press(&st, &ui, SETTINGS_ROW_DEFAULTS, 0, NULL) ==
               SETTINGS_PRESS_NOTHING &&
@@ -891,8 +894,9 @@ static void test_shutter_setting(void)
     CHECK(settings_parse("version=4\nshutter=l\n", &back, err, sizeof(err)) &&
               back.camera_shutter == SHUTTER_L,
           "shutter=l was not read: %s", err);
-    CHECK(!settings_parse("version=4\nshutter=x\n", &back, err, sizeof(err)),
-          "shutter=x was accepted");
+    CHECK(settings_parse("version=4\nshutter=x\n", &back, err, sizeof(err)) &&
+              back.camera_shutter == SHUTTER_R,
+          "shutter=x was not its default: %s", err);
     CHECK(!settings_parse("version=5\nshutter=l\n", &back, err, sizeof(err)),
           "a version 5 file was accepted");
     st.camera_shutter = SHUTTER_A;
@@ -914,8 +918,8 @@ static void test_shutter_setting(void)
     }
     remove(path);
 
-    // Scrolling: with the row present BUTTONS has eleven rows, and the walk
-    // through them keeps every one of them on screen.
+    // With the row present BUTTONS has eight rows and still fits without
+    // scrolling.
     settings_ui_init(&ui);
     settings_ui_tab(&st, &ui, SETTINGS_TAB_BUTTONS);
     for (unsigned i = 0; i + 1 < settings_tab_rows(SETTINGS_TAB_BUTTONS); i++) {
@@ -925,8 +929,8 @@ static void test_shutter_setting(void)
                                 NULL, &ry, NULL, NULL),
               "row %u scrolled out of view at scroll %u", ui.row, ui.scroll);
     }
-    CHECK(ui.row == SETTINGS_ROW_BUTTONS_RESET && ui.scroll > 0,
-          "the bottom of BUTTONS is not scrolled to");
+    CHECK(ui.row == SETTINGS_ROW_DEFAULTS && ui.scroll == 0,
+          "the bottom of BUTTONS is not DEFAULTS");
     settings_ui_move(&st, &ui, 0, 1);
     CHECK(ui.row == SETTINGS_ROW_BUTTON_A && ui.scroll == 0,
           "wrapping BUTTONS did not go back to the top");
@@ -946,7 +950,7 @@ static void test_picture_setting(void)
     settings_set_camera_available(0);
     settings_defaults(&st);
     settings_ui_init(&ui);
-    CHECK(settings_tab_rows(SETTINGS_TAB_CUSTOMIZE) == 10,
+    CHECK(settings_tab_rows(SETTINGS_TAB_LINK) == 3,
           "a card with no camera grew a picture row");
     CHECK(!settings_row_rect(SETTINGS_ROW_PICTURE, 0, &x, &y, &w, &h),
           "an absent row still had a rect");
@@ -956,12 +960,10 @@ static void test_picture_setting(void)
 
     // A card with one: the row exists, FULL is the default, SMALL sticks.
     settings_set_camera_available(1);
-    CHECK(settings_tab_rows(SETTINGS_TAB_CUSTOMIZE) == 12,
-          "CUSTOMIZE did not grow the picture and live-view rows");
-    CHECK(settings_row_tab(SETTINGS_ROW_PICTURE) == SETTINGS_TAB_CUSTOMIZE,
-          "the picture row is not on CUSTOMIZE");
-    // CUSTOMIZE is nine rows long with the camera's, so the row sits past
-    // the first screenful -- its rect needs the scrolled offset.
+    CHECK(settings_tab_rows(SETTINGS_TAB_LINK) == 5,
+          "LINK did not grow the picture and live-view rows");
+    CHECK(settings_row_tab(SETTINGS_ROW_PICTURE) == SETTINGS_TAB_LINK,
+          "the picture row is not on LINK");
     const unsigned pscroll = settings_test_scroll(SETTINGS_ROW_PICTURE);
     CHECK(settings_row_rect(SETTINGS_ROW_PICTURE, pscroll, &x, &y, &w, &h) &&
               x >= 0 && x + w <= 256 && y + h <= 160,
@@ -1002,8 +1004,9 @@ static void test_picture_setting(void)
         CHECK(settings_parse("version=4\nsound=chip\n", &lv, err, sizeof(err)) &&
                   lv.liveview == SETTINGS_LIVEVIEW_GREY,
               "a file without liveview= did not get GREY: %s", err);
-        CHECK(!settings_parse("version=4\nliveview=sepia\n", &lv, err, sizeof(err)),
-              "liveview=sepia was accepted");
+        CHECK(settings_parse("version=4\nliveview=sepia\n", &lv, err, sizeof(err)) &&
+                  lv.liveview == SETTINGS_LIVEVIEW_GREY,
+              "liveview=sepia was not its default: %s", err);
     }
     settings_set_camera_available(0);
     CHECK(settings_press(&st, &ui, SETTINGS_ROW_LIVEVIEW, 0, NULL) ==
@@ -1021,8 +1024,9 @@ static void test_picture_setting(void)
     CHECK(settings_parse("version=4\npicture=small\n", &back, err, sizeof(err)) &&
               back.picture == SETTINGS_PICTURE_SMALL,
           "picture=small was not read: %s", err);
-    CHECK(!settings_parse("version=4\npicture=x\n", &back, err, sizeof(err)),
-          "picture=x was accepted");
+    CHECK(settings_parse("version=4\npicture=x\n", &back, err, sizeof(err)) &&
+              back.picture == SETTINGS_PICTURE_FULL,
+          "picture=x was not its default: %s", err);
     st.picture = SETTINGS_PICTURE_SMALL;
     static const char path[] = "/tmp/dsterm-picture-settings.cfg";
     CHECK(settings_save(path, &st, err, sizeof(err)) &&
@@ -1058,7 +1062,7 @@ static void test_settings_page(void)
         const settings_row_t row = (settings_row_t)r;
         const char *label = settings_row_label(row);
         CHECK(label && label[0], "row %d has no label", r);
-        CHECK(strlen(label) * 6 <= SETTINGS_OPTION_X - SETTINGS_LABEL_X,
+        CHECK((int)lang_display_cols(label) * 6 <= settings_row_option_x(row) - SETTINGS_LABEL_X,
               "row %d's label runs into its chips", r);
         CHECK(settings_row_note(row)[0],
               "row %d has no note saying what it does", r);
@@ -1136,7 +1140,7 @@ static void test_settings_page(void)
                   SETTINGS_OPTIONS_MAX,
               "a touch on row %d's label pressed a chip", i);
     }
-    CHECK(settings_row_hit(SETTINGS_TAB_CUSTOMIZE, 0, 128, 180) == SETTINGS_ROW_COUNT,
+    CHECK(settings_row_hit(SETTINGS_TAB_SOUND, 0, 128, 180) == SETTINGS_ROW_COUNT,
           "a touch on the extension's floor hit a settings row");
 
     // And sized to their own labels rather than to a constant: SONNET is two
@@ -1277,13 +1281,13 @@ static void test_settings_page(void)
 
     // The tabs: CUSTOMIZE opens on its first row, on that row's value, and
     // its own lap stays inside it.  Every tab fits above the extension strip.
-    settings_ui_tab(&settings, &ui, SETTINGS_TAB_CUSTOMIZE);
+    settings_ui_tab(&settings, &ui, SETTINGS_TAB_SOUND);
     CHECK(ui.row == SETTINGS_ROW_SOUND &&
               ui.option == settings_option_current(&settings, SETTINGS_ROW_SOUND),
           "CUSTOMIZE did not open on SOUND, on its value");
     for (int i = 0; i < 20; i++) {
         settings_ui_move(&settings, &ui, 0, -1);
-        CHECK(settings_row_tab((settings_row_t)ui.row) == SETTINGS_TAB_CUSTOMIZE,
+        CHECK(settings_row_tab((settings_row_t)ui.row) == SETTINGS_TAB_SOUND,
               "moving up left the CUSTOMIZE tab");
     }
     for (int i = 0; i < SETTINGS_ROW_COUNT; i++) {
@@ -1322,8 +1326,10 @@ static void test_settings_page(void)
                              sizeof(terr)) &&
                   back.theme == SETTINGS_THEME_MOSS && back.typing == 0,
               "theme or typing not read: %s", terr);
-        CHECK(!settings_parse("version=4\ntheme=purple\n", &back, terr, sizeof(terr)),
-              "an unknown theme was accepted");
+        CHECK(settings_parse("version=4\ntheme=purple\ntyping=off\n", &back, terr,
+                             sizeof(terr)) &&
+                  back.theme == SETTINGS_THEME_CLAY && back.typing == 0,
+              "an unknown theme was not its default alone: %s", terr);
         CHECK(settings_parse("version=4\nsound=soft\n", &back, terr, sizeof(terr)) &&
                   back.sound == SETTINGS_SOUND_SNES,
               "sound=soft (the chip's own word) was refused: %s", terr);
@@ -1396,23 +1402,24 @@ static void test_settings_page(void)
     if (leftover) fclose(leftover);
     CHECK(leftover == NULL, "a settings save left its temporary behind");
 
-    // A file with no version, or a value this build does not know, is refused
-    // to defaults rather than half-applied.
+    // A file with no version is refused to defaults rather than half-applied;
+    // a value this build does not know costs only its own key.
     CHECK(!settings_parse("model=opus\n", &loaded, err, sizeof(err)),
           "a settings file with no version was accepted");
     CHECK(loaded.god_mode == 0 && loaded.model == SETTINGS_MODEL_UNSET,
           "a refused settings file left values behind");
-    CHECK(!settings_parse("version=2\nmodel=nonesuch\n", &loaded,
-                          err, sizeof(err)),
-          "an unknown model was accepted");
+    CHECK(settings_parse("version=2\nmodel=nonesuch\nboot=keys\n", &loaded,
+                         err, sizeof(err)) &&
+              loaded.model == SETTINGS_MODEL_UNSET && loaded.boot == SETTINGS_BOOT_KEYS,
+          "an unknown model was not its default alone: %s", err);
     // But an unknown *key* is forward compatibility, not corruption.
     CHECK(settings_parse("version=2\nmodel=opus\nfuture=42\n", &loaded,
                          err, sizeof(err)) &&
           loaded.model == SETTINGS_MODEL_OPUS,
           "a key from a later build threw the whole file away");
     // And god mode is never something a file can turn on by being malformed.
-    CHECK(!settings_parse("version=2\ngod_mode=maybe\n", &loaded,
-                          err, sizeof(err)) && loaded.god_mode == 0,
+    CHECK(settings_parse("version=2\ngod_mode=on\ngod_mode=maybe\n", &loaded,
+                         err, sizeof(err)) && loaded.god_mode == 0,
           "a malformed god_mode left it armed");
 
     // A version 1 file still loads.  It carried two keys this build does not
@@ -1435,8 +1442,9 @@ static void test_settings_page(void)
     CHECK(settings_parse("version=4\nautoconnect=off\n", &loaded, err, sizeof(err)) &&
               loaded.autoconnect == 0,
           "autoconnect=off was not read: %s", err);
-    CHECK(!settings_parse("version=4\nautoconnect=maybe\n", &loaded, err, sizeof(err)),
-          "a bad autoconnect value was accepted");
+    CHECK(settings_parse("version=4\nautoconnect=maybe\n", &loaded, err, sizeof(err)) &&
+              loaded.autoconnect == 1,
+          "a bad autoconnect value was not its default: %s", err);
     {
         settings_t off;
         settings_defaults(&off);
@@ -1461,14 +1469,15 @@ static void test_settings_page(void)
     CHECK(settings_parse("version=4\naddresses=hide\n", &loaded, err, sizeof(err)) &&
               loaded.hide_addresses == 1,
           "addresses=hide was not read: %s", err);
-    CHECK(!settings_parse("version=4\naddresses=blur\n", &loaded, err, sizeof(err)),
-          "a bad addresses value was accepted");
+    CHECK(settings_parse("version=4\naddresses=blur\n", &loaded, err, sizeof(err)) &&
+              loaded.hide_addresses == 0,
+          "a bad addresses value was not its default: %s", err);
     {
         settings_t hide;
         settings_defaults(&hide);
         settings_ui_t ui;
         settings_ui_init(&ui);
-        CHECK(settings_row_tab(SETTINGS_ROW_ADDRESSES) == SETTINGS_TAB_CUSTOMIZE &&
+        CHECK(settings_row_tab(SETTINGS_ROW_ADDRESSES) == SETTINGS_TAB_SCREEN &&
                   settings_option_current(&hide, SETTINGS_ROW_ADDRESSES) == 0 &&
                   settings_press(&hide, &ui, SETTINGS_ROW_ADDRESSES, 1, NULL) ==
                       SETTINGS_PRESS_CHANGED &&
@@ -1609,6 +1618,125 @@ static void test_quick(void)
           "the PHOTO row's words are wrong");
     CHECK(quick_row_count(1) == QUICK_ROW_COUNT && quick_row_count(0) == QUICK_ROW_COUNT - 1,
           "the camera-only row did not drop off");
+
+    // Saved quick commands (/dsterm/quick.txt): any printable prompt text (not
+    // only slash commands), ordered built-ins -> saved -> server's -> + ADD,
+    // bounded at QUICK_SAVED_MAX (16) and QUICK_SAVED_TEXT_MAX (1024), corrupt
+    // lines skipped, empty file yields 0, round-trip preserved.
+    static quick_saved_t qs, qs_back;
+    quick_saved_init(&qs);
+    CHECK(qs.count == 0, "quick_saved_init did not zero count");
+    CHECK(quick_saved_add(&qs, "run pytest and fix any failure   \n") &&
+              qs.count == 1 &&
+              strcmp(qs.items[0], "run pytest and fix any failure") == 0,
+          "plain prompt text was not saved and trimmed");
+    CHECK(quick_saved_add(&qs, "line one\nline two with \\ backslash") &&
+              qs.count == 2,
+          "multi-line prompt was not saved");
+    // Adding an existing command is idempotent.
+    CHECK(quick_saved_add(&qs, "run pytest and fix any failure") && qs.count == 2,
+          "duplicate saved command grew the list");
+    // Empty, control bytes, and > 1024 bytes are refused.
+    CHECK(!quick_saved_add(&qs, "   \t\n") &&
+              !quick_saved_add(&qs, "bad\x01char"),
+          "empty or control-byte command was accepted");
+    static char overlong[QUICK_SAVED_TEXT_MAX + 3];
+    memset(overlong, 'x', QUICK_SAVED_TEXT_MAX + 1);
+    overlong[QUICK_SAVED_TEXT_MAX + 1] = '\0';
+    CHECK(!quick_saved_add(&qs, overlong), "overlong command (> 1024) was accepted");
+    overlong[QUICK_SAVED_TEXT_MAX] = '\0';
+    CHECK(quick_saved_add(&qs, overlong) && qs.count == 3,
+          "exact composer-limit command (1024 bytes) was refused");
+    CHECK(quick_saved_remove(&qs, 2) && qs.count == 2,
+          "removing the 1024-byte command failed");
+
+    // Why a save fails, so the composer can keep the text and say so; a tab
+    // (from a snippet or the clipboard) is a space, not a refusal; and a
+    // command already in the list reports where it is.
+    {
+        static quick_saved_t qa;
+        unsigned at = 99;
+        quick_saved_init(&qa);
+        CHECK(quick_saved_add_at(&qa, " \t \n", &at) == QUICK_ADD_EMPTY,
+              "spaces and a tab were not reported empty");
+        CHECK(quick_saved_add_at(&qa, "run\tthe tests", &at) == QUICK_ADD_OK &&
+                  at == 0 && strcmp(qa.items[0], "run the tests") == 0,
+              "a tab was refused or kept instead of becoming a space");
+        CHECK(quick_saved_add_at(&qa, "bad\x01", &at) == QUICK_ADD_INVALID,
+              "a control byte was not reported invalid");
+        CHECK(quick_saved_add_at(&qa, overlong, &at) == QUICK_ADD_OK && at == 1,
+              "the composer-limit command was refused");
+        overlong[QUICK_SAVED_TEXT_MAX] = 'x';
+        CHECK(quick_saved_add_at(&qa, overlong, &at) == QUICK_ADD_TOO_LONG,
+              "an overlong command was not reported too long");
+        overlong[QUICK_SAVED_TEXT_MAX] = '\0';
+        for (unsigned i = qa.count; i < QUICK_SAVED_MAX; i++) {
+            char item[16];
+            snprintf(item, sizeof(item), "cmd %u", i);
+            (void)quick_saved_add(&qa, item);
+        }
+        CHECK(quick_saved_add_at(&qa, "one too many", &at) == QUICK_ADD_FULL,
+              "a full list was not reported full");
+        at = 99;
+        CHECK(quick_saved_add_at(&qa, "run the tests", &at) == QUICK_ADD_OK && at == 0,
+              "an existing command did not report its own place");
+    }
+
+    // COMMANDS menu ordering: built-ins, then saved, then server's, then + ADD.
+    (void)quick_commands_apply(&cmds, (const uint8_t *)"/deploy\n", 8);
+    CHECK(quick_commands_total(&cmds, &qs) == builtin + 2u + 1u + 1u,
+          "quick_commands_total wrong (%u)", quick_commands_total(&cmds, &qs));
+    const char *etext = NULL;
+    unsigned sidx = 99;
+    CHECK(quick_commands_entry(&cmds, &qs, 0, &etext, &sidx) == QUICK_CMD_BUILTIN &&
+              strcmp(etext, "/compact") == 0,
+          "entry 0 is not /compact");
+    CHECK(quick_commands_entry(&cmds, &qs, builtin, &etext, &sidx) == QUICK_CMD_SAVED &&
+              sidx == 0 && strcmp(etext, "run pytest and fix any failure") == 0,
+          "saved command 0 is not right after built-ins");
+    CHECK(quick_commands_entry(&cmds, &qs, builtin + 1u, &etext, &sidx) == QUICK_CMD_SAVED &&
+              sidx == 1,
+          "saved command 1 is not second");
+    CHECK(quick_commands_entry(&cmds, &qs, builtin + 2u, &etext, &sidx) == QUICK_CMD_SERVER &&
+              strcmp(etext, "/deploy") == 0,
+          "server command is not after saved commands");
+    CHECK(quick_commands_entry(&cmds, &qs, builtin + 3u, &etext, &sidx) == QUICK_CMD_ADD &&
+              strcmp(etext, "+ ADD") == 0,
+          "last row of COMMANDS is not + ADD");
+    CHECK(quick_commands_entry(&cmds, &qs, builtin + 4u, &etext, &sidx) == QUICK_CMD_NONE,
+          "out-of-range row was not QUICK_CMD_NONE");
+
+    // Round-trip format & parse, empty file, corrupt file, and count cap (16).
+    static char qbuf[4096];
+    const size_t qlen = quick_saved_format(&qs, qbuf, sizeof(qbuf));
+    CHECK(qlen > 0, "quick_saved_format failed");
+    quick_saved_parse(&qs_back, qbuf);
+    CHECK(qs_back.count == 2 &&
+              strcmp(qs_back.items[0], qs.items[0]) == 0 &&
+              strcmp(qs_back.items[1], qs.items[1]) == 0,
+          "quick_saved round-trip failed");
+    quick_saved_parse(&qs_back, "");
+    CHECK(qs_back.count == 0, "empty quick.txt did not parse to 0 items");
+    quick_saved_parse(&qs_back, "good prompt\nbad \\z escape\n\x02\nsecond good\ntrailing\\");
+    CHECK(qs_back.count == 2 &&
+              strcmp(qs_back.items[0], "good prompt") == 0 &&
+              strcmp(qs_back.items[1], "second good") == 0,
+          "corrupt lines in quick.txt were not skipped cleanly (%u)", qs_back.count);
+
+    quick_saved_init(&qs);
+    for (unsigned i = 0; i < QUICK_SAVED_MAX + 4u; i++) {
+        char item[32];
+        snprintf(item, sizeof(item), "custom command %u", i);
+        const int ok = quick_saved_add(&qs, item);
+        CHECK(ok == (i < QUICK_SAVED_MAX),
+              "quick_saved_add at %u returned %d", i, ok);
+    }
+    CHECK(qs.count == QUICK_SAVED_MAX, "saved command count did not cap at %u",
+          QUICK_SAVED_MAX);
+    CHECK(quick_saved_remove(&qs, 0) && qs.count == QUICK_SAVED_MAX - 1u &&
+              strcmp(qs.items[0], "custom command 1") == 0 &&
+              !quick_saved_remove(&qs, 99),
+          "quick_saved_remove did not shift items");
 }
 
 // The bottom screen as text (mirror.h): glyphs land in the cell under their
@@ -4363,6 +4491,1623 @@ static void print_interop_vectors(void)
     char ah[2 * sizeof(aframe) + 1];
     hex(aframe, an, ah);
     printf("INTEROP answer %s\n", ah);
+
+    // Voice ADPCM and wire vectors, pinned against dsterm/voice.py and
+    // dsterm/protocol.py.
+    {
+        int16_t pcm[16], decoded[16];
+        uint8_t adpcm[8];
+        for (int i = 0; i < 16; i++) pcm[i] = (int16_t)(i * 2000 - 15000);
+        voice_adpcm_state_t st;
+        voice_adpcm_init(&st);
+        CHECK(voice_adpcm_encode(&st, pcm, 16, adpcm) == 8, "adpcm encode len");
+        voice_adpcm_init(&st);
+        CHECK(voice_adpcm_decode(&st, adpcm, 8, decoded) == 16, "adpcm decode len");
+        uint8_t pcm_le[32];
+        for (int i = 0; i < 16; i++) {
+            const uint16_t u = (uint16_t)decoded[i];
+            pcm_le[2 * i] = (uint8_t)(u & 0xFF);
+            pcm_le[2 * i + 1] = (uint8_t)(u >> 8);
+        }
+        char h_adpcm[17], h_pcm[65];
+        hex(adpcm, 8, h_adpcm);
+        hex(pcm_le, 32, h_pcm);
+        printf("INTEROP voice-adpcm %s:%s\n", h_adpcm, h_pcm);
+
+        uint8_t wbuf[128];
+        size_t wlen = 0;
+        wlen += proto_encode_voice_start(wbuf + wlen, VOICE_FORMAT_IMA_ADPCM_8K, "es");
+        uint8_t chunk[32];
+        for (int i = 0; i < 32; i++) chunk[i] = (uint8_t)((i * 17) & 0xFF);
+        wlen += proto_encode_voice_chunk(wbuf + wlen, 480, chunk, 32);
+        wlen += proto_encode_voice_end(wbuf + wlen, 512, 0xDEADBEEFu);
+        char h_wire[257];
+        hex(wbuf, wlen, h_wire);
+        printf("INTEROP voice-wire %s\n", h_wire);
+    }
+}
+
+static void test_lang_and_custom_packs(void)
+{
+    lang_init();
+    CHECK(lang_count() == LANG_BUILTIN_COUNT && lang_current() == LANG_EN,
+          "default language is not English");
+    CHECK(strcmp(lang_code(LANG_EN), "en") == 0 &&
+              strcmp(lang_code(LANG_ES), "es") == 0,
+          "built-in language codes do not match en/es");
+    CHECK(strcmp(tr(TR_CONTROL_KEYS), "KEYS") == 0, "EN control.keys wrong");
+
+    lang_set_current(LANG_ES);
+    CHECK(strcmp(tr(TR_CONTROL_KEYS), "TECLAS") == 0, "ES control.keys wrong");
+    CHECK(lang_display_cols("键盘") == 4, "CJK 2-char string is not 4 cols");
+    lang_set_current(LANG_ZH);
+    CHECK(strcmp(tr(TR_CONTROL_KEYS), "键盘") == 0, "ZH control.keys wrong");
+    lang_set_current(LANG_JA);
+    CHECK(strcmp(tr(TR_CONTROL_KEYS), "キー") == 0, "JA control.keys wrong");
+    CHECK(lang_count() == 4 && lang_find_code("zh") == LANG_ZH &&
+              lang_find_code("ja") == LANG_JA,
+          "Chinese and Japanese are not offered");
+
+    // Every non-ASCII codepoint in every built-in language must have a glyph
+    // -- composed (lang_latin_glyph) or in ui_font_table -- so nothing
+    // renders as '?' on screen.
+    int missing_glyphs = 0;
+    for (unsigned l = 0; l < LANG_BUILTIN_COUNT; l++) {
+        for (unsigned id = 0; id < TR_COUNT; id++) {
+            const char *s = lang_tr_at(l, (tr_id_t)id);
+            uint32_t cp;
+            while ((cp = lang_utf8_next(&s)) != 0) {
+                uint8_t composed[8];
+                if (cp >= 0x80 && !ui_font_lookup(cp) &&
+                    !lang_latin_glyph(cp, font6x8, composed)) {
+                    missing_glyphs++;
+                }
+            }
+        }
+    }
+    CHECK(missing_glyphs == 0, "%d built-in UI codepoints missing from ui_font.h",
+          missing_glyphs);
+
+    // Custom .lang import: adds a chip, translates set keys, falls back to EN
+    // for unset keys, and persists in settings.cfg.
+    char err[64] = "";
+    const int fr = lang_load_text(
+        "code = fr\nlabel = FR\nname = Français\ncontrol.keys = CLAVIER\n",
+        NULL, err, sizeof(err));
+    CHECK(fr == LANG_BUILTIN_COUNT && lang_count() == LANG_BUILTIN_COUNT + 1,
+          "custom language pack did not register: %s", err);
+    lang_set_current((unsigned)fr);
+    CHECK(strcmp(tr(TR_CONTROL_KEYS), "CLAVIER") == 0 &&
+              strcmp(tr(TR_CONTROL_REMOTE), "REMOTE") == 0,
+          "custom language did not override control.keys and fall back to EN");
+
+    settings_t st, back;
+    settings_ui_t ui;
+    settings_defaults(&st);
+    settings_ui_init(&ui);
+    CHECK(settings_press(&st, &ui, SETTINGS_ROW_LANGUAGE, (unsigned)fr, NULL) ==
+              SETTINGS_PRESS_CHANGED &&
+          st.language == (unsigned)fr,
+          "SETTINGS_ROW_LANGUAGE could not select imported pack");
+    static const char lpath[] = "/tmp/dsterm-lang-settings.cfg";
+    CHECK(settings_save(lpath, &st, err, sizeof(err)) &&
+              settings_load(lpath, &back, err, sizeof(err)) &&
+              back.language == (unsigned)fr,
+          "custom language did not survive settings save/load: %s", err);
+    remove(lpath);
+
+    // Reset back to the built-ins for subsequent tests.
+    lang_init();
+}
+
+static void test_latin_glyphs_are_letters_with_marks(void)
+{
+    // The atlas drew a, á, à and â as near-identical blobs.  Composed from
+    // the terminal font, each accented letter is its own letter exactly
+    // (lower case) or with one repeated row given up (upper case), plus a
+    // mark that no other mark shares, clear of the letter's own pixels.
+    uint8_t g[8], h[8];
+    static const struct { uint32_t cp; char base; } LOWER[] = {
+        { 0xE1, 'a' }, { 0xE9, 'e' }, { 0xF3, 'o' }, { 0xFA, 'u' },
+        { 0xF1, 'n' }, { 0xE0, 'a' }, { 0xFC, 'u' }, { 0xFF, 'y' },
+    };
+    for (unsigned i = 0; i < sizeof(LOWER) / sizeof(LOWER[0]); i++) {
+        CHECK(lang_latin_glyph(LOWER[i].cp, font6x8, g),
+              "U+%04X was not composed", (unsigned)LOWER[i].cp);
+        const uint8_t *base = font6x8[LOWER[i].base - 0x20];
+        CHECK(memcmp(g + 2, base + 2, 6) == 0,
+              "U+%04X changed its letter", (unsigned)LOWER[i].cp);
+        CHECK((g[0] | g[1]) != 0, "U+%04X has no mark", (unsigned)LOWER[i].cp);
+    }
+    // i loses its dot to the mark rather than wearing both.
+    CHECK(lang_latin_glyph(0xED, font6x8, g) && g[1] == 0x08 && g[0] == 0x04,
+          "í kept its dot under the accent");
+    // Marks are told apart: á, à, â, ã, ä all differ, and differ from a.
+    uint8_t seen[5][8];
+    for (unsigned m = 0; m < 5; m++) {
+        CHECK(lang_latin_glyph(0xE0 + m, font6x8, seen[m]), "a-variant %u", m);
+        CHECK(memcmp(seen[m], font6x8['a' - 0x20], 8) != 0, "a-variant %u is plain a", m);
+        for (unsigned k = 0; k < m; k++) {
+            CHECK(memcmp(seen[m], seen[k], 8) != 0,
+                  "a-variants %u and %u draw the same glyph", k, m);
+        }
+    }
+    // Upper case: mark on row 0, a clear row under it, the letter below.
+    CHECK(lang_latin_glyph(0xC1, font6x8, g) && g[0] != 0 && g[1] == 0 &&
+              g[7] == 0 && g[2] == font6x8['A' - 0x20][1],
+          "Á is not mark, gap, A");
+    CHECK(lang_latin_glyph(0xD1, font6x8, h) && memcmp(g, h, 8) != 0,
+          "Ñ and Á are the same glyph");
+    // Cedilla hangs below.
+    CHECK(lang_latin_glyph(0xE7, font6x8, g) && g[7] != 0 &&
+              memcmp(g, font6x8['c' - 0x20], 7) == 0,
+          "ç is not c with a hanging mark");
+    // Not letters with marks: left to the atlas.
+    CHECK(!lang_latin_glyph(0xD7, font6x8, g) && !lang_latin_glyph(0xDF, font6x8, g) &&
+              !lang_latin_glyph(0xBF, font6x8, g) && !lang_latin_glyph('a', font6x8, g) &&
+              !lang_latin_glyph(0x4E2D, font6x8, g),
+          "something that is not an accented letter was composed");
+}
+
+static void test_settings_unknown_language_keeps_the_rest(void)
+{
+    // A language code nothing answers to -- a custom pack taken off the SD,
+    // or a code from some other build -- shows English and keeps every other
+    // setting.
+    lang_init();
+    settings_t st;
+    char err[64] = "";
+    static const char *const CODES[] = { "xx-gone", "fr", "" };
+    for (unsigned i = 0; i < sizeof(CODES) / sizeof(CODES[0]); i++) {
+        char text[160];
+        (void)snprintf(text, sizeof(text),
+                       "version=4\ngod_mode=on\ntyping=off\nlang=%s\n"
+                       "button_b=space\n", CODES[i]);
+        settings_t defaults;
+        settings_defaults(&defaults);
+        CHECK(settings_parse(text, &st, err, sizeof(err)),
+              "lang=%s threw the whole file away: %s", CODES[i], err);
+        CHECK(st.language == LANG_EN, "lang=%s did not fall back to English",
+              CODES[i]);
+        CHECK(st.god_mode == 1 && st.typing == 0 &&
+                  st.buttons.action[BUTTON_B] != defaults.buttons.action[BUTTON_B],
+              "lang=%s reset the settings beside it", CODES[i]);
+    }
+    CHECK(settings_parse("version=4\nlang=es\n", &st, err, sizeof(err)) &&
+              st.language == LANG_ES,
+          "a known language no longer loads");
+    CHECK(settings_parse("version=4\nlang=zh\n", &st, err, sizeof(err)) &&
+              st.language == LANG_ZH &&
+              settings_parse("version=4\nlang=ja\n", &st, err, sizeof(err)) &&
+              st.language == LANG_JA,
+          "Chinese or Japanese does not load from the settings file");
+}
+
+static void test_chime_headline_every_language(void)
+{
+    // English is the bytes it always was; Spanish covers every state English
+    // has (it used to collapse the lantern, SENT, STREAMING and DONE into
+    // two lines); and the approval line follows a language change without
+    // being rebuilt out of its own buffers.
+    lang_init();
+    chime_init();
+    reset_sound();
+    chime_set_answer_buttons("A", "X");
+    CHECK(strcmp(chime_headline(), "Ready") == 0, "EN idle: '%s'", chime_headline());
+    chime_sent();
+    CHECK(strcmp(chime_headline(), "Sent -- waiting for Claude") == 0,
+          "EN sent: '%s'", chime_headline());
+    lang_set_current(LANG_ES);
+    CHECK(strcmp(chime_headline(), "Enviado -- esperando a Claude") == 0,
+          "ES sent: '%s'", chime_headline());
+    lang_set_current(LANG_EN);
+    chime_session_lantern();
+    CHECK(strcmp(chime_headline(), "Another session has new output") == 0,
+          "EN lantern: '%s'", chime_headline());
+    lang_set_current(LANG_ES);
+    CHECK(strcmp(chime_headline(), "Otra sesión tiene salida nueva") == 0,
+          "ES lantern: '%s'", chime_headline());
+    lang_set_current(LANG_EN);
+    chime_init();                          // the lantern's moment is over
+
+    chime_claude_state(2);
+    CHECK(strcmp(chime_headline(), "Claude is working") == 0, "EN working");
+    chime_claude_state(4);
+    CHECK(strcmp(chime_headline(), "Claude asked you something") == 0, "EN asked");
+    chime_claude_state(3);
+    CHECK(strcmp(chime_headline(), "Claude needs your OK:  A yes   X no") == 0,
+          "EN approval: '%s'", chime_headline());
+    lang_set_current(LANG_ES);
+    CHECK(strcmp(chime_headline(), "Claude necesita tu OK:  A sí   X no") == 0,
+          "ES approval: '%s'", chime_headline());
+    chime_set_answer_buttons("B", NULL);
+    CHECK(strcmp(chime_headline(), "Claude necesita tu OK:  B sí") == 0,
+          "ES approval, one button: '%s'", chime_headline());
+    lang_set_current(LANG_EN);
+    CHECK(strcmp(chime_headline(), "Claude needs your OK:  B yes") == 0,
+          "EN approval after switching back: '%s'", chime_headline());
+    chime_claude_state(1);
+    CHECK(strcmp(chime_headline(), "Done -- your turn") == 0,
+          "EN done: '%s'", chime_headline());
+    lang_set_current(LANG_ES);
+    CHECK(strcmp(chime_headline(), "Hecho -- tu turno") == 0,
+          "ES done: '%s'", chime_headline());
+
+    // A custom pack with none of the headline keys reads English lines, not
+    // another state's wording.
+    char err[64] = "";
+    const int fr = lang_load_text("code = fr\ncontrol.keys = CLAVIER\n",
+                                  NULL, err, sizeof(err));
+    CHECK(fr >= 0, "custom pack refused: %s", err);
+    lang_set_current((unsigned)fr);
+    CHECK(strcmp(chime_headline(), "Done -- your turn") == 0,
+          "a pack without chime.done did not fall back to English");
+
+    chime_set_answer_buttons("A", "X");
+    lang_init();
+    chime_init();
+    reset_sound();
+}
+
+static void test_custom_pack_labels_never_push_off_screen(void)
+{
+    // A custom pack may name a tab or a row anything up to 63 bytes. The tab
+    // chips still fit the row, and no option column runs past its cap.
+    lang_init();
+    char err[64] = "";
+    const int xx = lang_load_text(
+        "code = xx\n"
+        "settings.tab.session = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n"
+        "settings.tab.sound = BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\n"
+        "settings.row.sound = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC\n"
+        "settings.row.mic = DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD\n",
+        NULL, err, sizeof(err));
+    CHECK(xx >= 0, "custom pack refused: %s", err);
+    lang_set_current((unsigned)xx);
+    int x, y, w, h;
+    CHECK(settings_tab_rect(SETTINGS_TAB_COUNT - 1, &x, &y, &w, &h) &&
+              x + w <= 256 - 20,
+          "a long custom tab name pushed the tabs to %d px", x + w);
+    for (unsigned r = 0; r < SETTINGS_ROW_COUNT; r++) {
+        CHECK(settings_row_option_x((settings_row_t)r) <= 124,
+              "row %u's chips start at %d px", r,
+              settings_row_option_x((settings_row_t)r));
+    }
+    lang_init();
+}
+
+// Every key in every built-in language, and every string that used to be
+// English-only measured against the box it is drawn in, with the same 6 px
+// per narrow / 12 px per wide character the renderer advances by.
+static int tr_px(const char *s) { return (int)lang_display_cols(s) * 6; }
+
+static void test_lang_coverage_and_budgets(void)
+{
+    lang_init();
+    for (unsigned l = 0; l < LANG_BUILTIN_COUNT; l++) {
+        for (unsigned id = 0; id < TR_COUNT; id++) {
+            const char *s = lang_builtin_string(l, (tr_id_t)id);
+            CHECK(s != NULL, "lang %s has no string for %s", lang_code(l),
+                  lang_key_name((tr_id_t)id));
+            CHECK(lang_key_name((tr_id_t)id) != NULL, "key %u has no name", id);
+        }
+    }
+
+    // English is the bytes the screens showed before these were keys.
+    static const struct { tr_id_t id; const char *en; } PINNED[] = {
+        { TR_QUICK_FOOT,          "the tile shows Claude's mode" },
+        { TR_QUICK_ADD,           "+ ADD" },
+        { TR_QUICK_CMD_HEAD,      "COMMANDS   A compose   X back" },
+        { TR_QUICK_CMD_HEAD_SAVED,"COMMANDS   A compose   Y forget   X back" },
+        { TR_QUICK_CMD_HEAD_SURE, "COMMANDS   A compose   Y SURE?   X back" },
+        { TR_QUICK_CMD_HEAD_ADD,  "COMMANDS   A add command   X back" },
+        { TR_QUICK_CMD_SUB,       "built in, saved (+ ADD), then computer's" },
+        { TR_QUICK_AGAIN_HEAD,    "AGAIN   A compose   Y forget   X back" },
+        { TR_QUICK_AGAIN_SUB,     "what you sent lately, newest first" },
+        { TR_LEGEND_SHOULDERS,    "L ctrl  R shift  L+R pick a tile" },
+        { TR_SETTINGS_RESET_SURE, "SURE?" },
+        { TR_COMPOSE_ADD_HEAD,    "ADD QUICK COMMAND: A saves on card" },
+        { TR_COMPOSE_ADD_KEYS,    "A saves   B deletes   X cancels" },
+        { TR_COMPOSE_ADD_FOCUS_KEYS, "START saves   B deletes   X leaves focus" },
+        { TR_QUICK_NOTE_NOT_HERE, "not on this computer" },
+        { TR_QUICK_NOTE_NO_STT,   "no speech-to-text on server" },
+        { TR_QUICK_NOTE_NO_SAVE,  "cannot save pictures here" },
+    };
+    for (size_t i = 0; i < sizeof(PINNED) / sizeof(PINNED[0]); i++) {
+        CHECK(strcmp(lang_tr_at(LANG_EN, PINNED[i].id), PINNED[i].en) == 0,
+              "EN %s changed: '%s'", lang_key_name(PINNED[i].id),
+              lang_tr_at(LANG_EN, PINNED[i].id));
+    }
+
+    char buf[160];
+    // The MIC meter, filled, is the bytes snprintf used to make.
+    lang_set_current(LANG_EN);
+    for (unsigned bars = 0; bars <= 8; bars++) {
+        static const tr_id_t METER[] = { TR_COMPOSE_METER_LATCHED,
+                                         TR_COMPOSE_METER_LATCH,
+                                         TR_COMPOSE_METER_HOLD };
+        static const char *const OLD[] = { "MIC [%-8.*s]  R/L stop  X cancel",
+                                           "MIC [%-8.*s]  L latch  X cancel",
+                                           "MIC [%-8.*s]  X cancel" };
+        char level[9], want[64];
+        snprintf(level, sizeof(level), "%-8.*s", (int)bars, "########");
+        for (size_t m = 0; m < 3; m++) {
+            snprintf(want, sizeof(want), OLD[m], (int)bars, "########");
+            lang_fill(buf, sizeof(buf), tr(METER[m]), level);
+            CHECK(!strcmp(buf, want), "EN meter changed: '%s'", buf);
+        }
+    }
+    CHECK(strcmp(lang_fill(buf, sizeof(buf), "d-pad picks  %s confirms", "A"),
+                 "d-pad picks  A confirms") == 0, "fill: '%s'", buf);
+    CHECK(strcmp(lang_fill(buf, sizeof(buf), "%d %s %s", "X"), "%d X %s") == 0,
+          "fill read more than one %%s, or a format: '%s'", buf);
+    CHECK(strcmp(lang_fill(buf, 5, "ab選択", NULL), "ab") == 0,
+          "fill cut a character in half: '%s'", buf);
+
+    int tx, ty, tile_w, th, relink_w;
+    kbd_control_rect(KBD_CONTROL_KEYS, &tx, &ty, &tile_w, &th);
+    kbd_control_rect(KBD_CONTROL_RECONNECT, &tx, &ty, &relink_w, &th);
+    static const tr_id_t TILE[] = {
+        TR_CONTROL_KEYS, TR_CONTROL_KEYS_SUB, TR_CONTROL_QUICK,
+        TR_CONTROL_QUICK_SUB, TR_CONTROL_PHOTO, TR_CONTROL_PHOTO_SUB,
+        TR_CONTROL_AGAIN, TR_CONTROL_AGAIN_SUB, TR_CONTROL_COMPOSE,
+        TR_CONTROL_COMPOSE_SUB, TR_CONTROL_REMOTE, TR_CONTROL_REMOTE_SUB,
+        TR_CONTROL_SETTINGS, TR_CONTROL_SETTINGS_SUB,
+    };
+    static const tr_id_t LINE[] = {
+        TR_QUICK_FOOT, TR_QUICK_CMD_HEAD, TR_QUICK_CMD_HEAD_SAVED,
+        TR_QUICK_CMD_HEAD_SURE, TR_QUICK_CMD_HEAD_ADD, TR_QUICK_CMD_SUB,
+        TR_QUICK_AGAIN_HEAD, TR_QUICK_AGAIN_SUB, TR_LEGEND_SHOULDERS,
+        TR_COMPOSE_ADD_HEAD, TR_COMPOSE_ADD_KEYS, TR_COMPOSE_ADD_FOCUS_KEYS,
+    };
+    static const char *const MODES[] = { "normal", "manual", "bypass", "edits",
+                                         "plan", "auto" };
+    for (unsigned l = 0; l < LANG_BUILTIN_COUNT; l++) {
+        lang_set_current(l);
+        const char *code = lang_code(l);
+        // Control tiles: two pixels clear on each side.
+        for (size_t i = 0; i < sizeof(TILE) / sizeof(TILE[0]); i++) {
+            CHECK(tr_px(tr(TILE[i])) <= tile_w - 4, "%s %s is %dpx, tile %dpx: '%s'",
+                  code, lang_key_name(TILE[i]), tr_px(tr(TILE[i])), tile_w,
+                  tr(TILE[i]));
+        }
+        for (size_t i = 0; i < sizeof(MODES) / sizeof(MODES[0]); i++) {
+            lang_fill(buf, sizeof(buf), tr(TR_CONTROL_QUICK_MODE), MODES[i]);
+            CHECK(tr_px(buf) <= tile_w - 4, "%s QUICK tile '%s' is %dpx",
+                  code, buf, tr_px(buf));
+        }
+        CHECK(tr_px(tr(TR_CONTROL_RELINK)) <= relink_w - 4,
+              "%s RELINK '%s' is %dpx, tile %dpx", code, tr(TR_CONTROL_RELINK),
+              tr_px(tr(TR_CONTROL_RELINK)), relink_w);
+        // Row 3's hints stop at column 30, where RELINK starts.
+        lang_fill(buf, sizeof(buf), tr(TR_CONTROL_HINT_CONFIRM), "A");
+        CHECK(tr_px(buf) <= 180, "%s confirm hint '%s' is %dpx", code, buf, tr_px(buf));
+        lang_fill(buf, sizeof(buf), tr(TR_CONTROL_HINT_UNDO), "A");
+        CHECK(tr_px(buf) <= 180, "%s undo hint '%s' is %dpx", code, buf, tr_px(buf));
+        CHECK(tr_px(tr(TR_CONTROL_HINT_SCROLL)) <= 180, "%s scroll hint is %dpx",
+              code, tr_px(tr(TR_CONTROL_HINT_SCROLL)));
+        CHECK(tr_px(tr(TR_CONTROL_HINT_FOCUS)) <= 180, "%s focus hint is %dpx",
+              code, tr_px(tr(TR_CONTROL_HINT_FOCUS)));
+        // Full-width lines: 42 columns, 252 px.
+        for (size_t i = 0; i < sizeof(LINE) / sizeof(LINE[0]); i++) {
+            CHECK(tr_px(tr(LINE[i])) <= 252, "%s %s is %dpx: '%s'", code,
+                  lang_key_name(LINE[i]), tr_px(tr(LINE[i])), tr(LINE[i]));
+        }
+        snprintf(buf, sizeof(buf), " %s", tr(TR_QUICK_AGAIN_EMPTY_0));
+        CHECK(tr_px(buf) <= 252, "%s empty AGAIN line 0 is %dpx", code, tr_px(buf));
+        snprintf(buf, sizeof(buf), " %s", tr(TR_QUICK_AGAIN_EMPTY_1));
+        CHECK(tr_px(buf) <= 252, "%s empty AGAIN line 1 is %dpx", code, tr_px(buf));
+        snprintf(buf, sizeof(buf), " %s", tr(TR_QUICK_ADD));
+        CHECK(tr_px(buf) <= 252, "%s + ADD row is %dpx", code, tr_px(buf));
+        // The meter, full, on its one line.
+        static const tr_id_t METERS[] = { TR_COMPOSE_METER_LATCHED,
+                                          TR_COMPOSE_METER_LATCH,
+                                          TR_COMPOSE_METER_HOLD };
+        for (size_t m = 0; m < 3; m++) {
+            lang_fill(buf, sizeof(buf), tr(METERS[m]), "########");
+            CHECK(tr_px(buf) <= 252 && strstr(buf, "########"),
+                  "%s meter '%s' is %dpx", code, buf, tr_px(buf));
+        }
+        // The connection's notes beside QUICK's VOICE and PHOTO rows: the
+        // note column is what the widest label leaves of 42 columns.
+        unsigned label_cols = 9u;
+        for (int i = 0; i < (int)QUICK_ROW_COUNT; i++) {
+            const unsigned c = lang_display_cols(quick_row_label((quick_row_t)i));
+            if (c > label_cols) label_cols = c;
+        }
+        static const tr_id_t NOTES[] = { TR_QUICK_NOTE_NOT_HERE,
+                                         TR_QUICK_NOTE_NO_STT,
+                                         TR_QUICK_NOTE_NO_SAVE };
+        for (size_t n = 0; n < 3; n++) {
+            CHECK(lang_display_cols(tr(NOTES[n])) <= 42u - 2u - label_cols,
+                  "%s QUICK note '%s' is cut", code, tr(NOTES[n]));
+        }
+        // DEFAULTS' chip holds SURE? whole.
+        settings_set_camera_available(1);
+        {
+            int cx, cy, cw, ch;
+            settings_ui_t sui;
+            settings_ui_init(&sui);
+            unsigned scroll = 0;
+            while (!settings_option_rect(SETTINGS_ROW_DEFAULTS, 0, scroll,
+                                         &cx, &cy, &cw, &ch) && scroll < 16) {
+                scroll++;
+            }
+            CHECK((int)lang_display_cols(tr(TR_SETTINGS_RESET_SURE)) * 6 + 4 <= cw &&
+                      cx + cw <= 256,
+                  "%s SURE? '%s' does not fit its %dpx chip", code,
+                  tr(TR_SETTINGS_RESET_SURE), cw);
+        }
+        // The Control legend, as subscreen.c assembles it, with the longest
+        // button name on the second line.
+        button_map_t m;
+        button_map_defaults(&m);
+        button_map_legend(&m, buf, sizeof(buf));
+        CHECK(tr_px(buf) <= 252, "%s legend '%s' is %dpx", code, buf, tr_px(buf));
+        CHECK(l != LANG_EN || strcmp(buf, "A enter  B delete  X esc  Y tab") == 0,
+              "EN legend changed: '%s'", buf);
+        snprintf(buf, sizeof(buf), "START %s  R+Y %s  SELECT %s", tr(TR_BUTTON_STOP),
+                 tr(TR_LEGEND_MODE), tr(TR_LEGEND_SCREENS));
+        CHECK(tr_px(buf) <= 252, "%s legend line 2 '%s' is %dpx", code, buf, tr_px(buf));
+        CHECK(l != LANG_EN || strcmp(buf, "START stop  R+Y mode  SELECT screens") == 0,
+              "EN legend line 2 changed: '%s'", buf);
+    }
+    lang_init();
+}
+
+static void test_layout_widths_every_language(void)
+{
+    lang_init();
+    settings_set_camera_available(1);
+
+    for (unsigned l = 0; l < LANG_BUILTIN_COUNT; l++) {
+        lang_set_current(l);
+
+        // 1. Settings tab chips: never overlap and never pass 256 px.
+        int prev_tab_right = 0;
+        for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
+            int tx = 0, ty = 0, tw = 0, th = 0;
+            const char *tlabel = settings_tab_label(t);
+            const int text_px = (int)lang_display_cols(tlabel) * 6;
+            CHECK(settings_tab_rect(t, &tx, &ty, &tw, &th),
+                  "lang %u tab %u has no rect", l, t);
+            CHECK(tx > prev_tab_right,
+                  "lang %u tab %u overlaps previous tab (%d <= %d)",
+                  l, t, tx, prev_tab_right);
+            CHECK(tw >= text_px + 4,
+                  "lang %u tab %u chip (%dpx) narrower than '%s' (%dpx)",
+                  l, t, tw, tlabel, text_px);
+            CHECK(tx + tw <= 256,
+                  "lang %u tab %u ends past 256px (%d)", l, t, tx + tw);
+            prev_tab_right = tx + tw;
+        }
+
+        // 2. Settings rows & chips: no label's pixel width passes its first
+        // chip's x, chips do not overlap, and no row's chips pass 256 px.
+        for (int r = 0; r < SETTINGS_ROW_COUNT; r++) {
+            const settings_row_t row = (settings_row_t)r;
+            const char *label = settings_row_label(row);
+            const int label_end = SETTINGS_LABEL_X +
+                                  (int)lang_display_cols(label) * 6;
+            int prev_right = label_end;
+            const unsigned count = settings_option_count(row);
+            for (unsigned o = 0; o < count; o++) {
+                int cx = 0, cy = 0, cw = 0, ch = 0;
+                CHECK(settings_option_rect(row, o, 0, &cx, &cy, &cw, &ch),
+                      "lang %u row %d option %u has no rect", l, r, o);
+                CHECK(cx > prev_right,
+                      "lang %u row %d ('%s') option %u at x=%d overlaps %d",
+                      l, r, label, o, cx, prev_right);
+                CHECK(cx + cw <= 256,
+                      "lang %u row %d option %u ends past 256px (%d)",
+                      l, r, o, cx + cw);
+                prev_right = cx + cw;
+            }
+        }
+
+        // 3. QUICK rows: formatted with lang_pad_cols, never pass 256 px (42 cols).
+        unsigned label_cols = 9u;
+        for (int i = 0; i < (int)QUICK_ROW_COUNT; i++) {
+            const unsigned c = lang_display_cols(quick_row_label((quick_row_t)i));
+            if (c > label_cols) label_cols = c;
+        }
+        CHECK(label_cols <= 12u, "lang %u QUICK label column too wide (%u)",
+              l, label_cols);
+        for (int i = 0; i < (int)QUICK_ROW_COUNT; i++) {
+            const quick_row_t r = (quick_row_t)i;
+            char lbl[48], note[96], row[160];
+            (void)lang_pad_cols(quick_row_label(r), label_cols, label_cols,
+                                lbl, sizeof(lbl));
+            if (r == QUICK_ROW_MODE) {
+                char mode_col[16];
+                (void)lang_pad_cols("normal", 8u, 8u, mode_col, sizeof(mode_col));
+                const unsigned rem = 42u - 1u - label_cols - 1u - 8u - 1u;
+                (void)lang_pad_cols(quick_row_note(r), 0u, rem, note, sizeof(note));
+                snprintf(row, sizeof(row), " %s %s %s", lbl, mode_col, note);
+            } else if (r == QUICK_ROW_COMMANDS || r == QUICK_ROW_AGAIN) {
+                const unsigned note_w = 42u - 1u - label_cols - 1u - 1u - 2u;
+                (void)lang_pad_cols(quick_row_note(r), note_w, note_w,
+                                    note, sizeof(note));
+                snprintf(row, sizeof(row), " %s %s %2u", lbl, note, 12u);
+            } else {
+                const unsigned rem = 42u - 1u - label_cols - 1u;
+                (void)lang_pad_cols(quick_row_note(r), 0u, rem, note, sizeof(note));
+                snprintf(row, sizeof(row), " %s %s", lbl, note);
+            }
+            const int px = (int)lang_display_cols(row) * 6;
+            CHECK(px <= 256, "lang %u QUICK row %d passes 256px (%dpx: '%s')",
+                  l, i, px, row);
+        }
+
+        // 4. Every translated string (composer bar, headlines, tiles, hints):
+        // fits its container (VOICE_BAR_W = 248px for mic bar, 76px for tile
+        // labels, 252px / 42 cols for full lines).
+        for (unsigned id = 0; id < TR_COUNT; id++) {
+            const char *s = lang_tr_at(l, (tr_id_t)id);
+            const int px = (int)lang_display_cols(s) * 6;
+            // The guide's pop-up text is wrapped to two lines of its box;
+            // test_guide_text_fits measures those against the box instead.
+            if (id == TR_GUIDE_INTRO ||
+                (id >= TR_GUIDE_DO_ENTER && id <= TR_GUIDE_DO_CLOSE_MENU)) {
+                continue;
+            }
+            CHECK(px <= 252,
+                  "lang %u key %s is %dpx (> 252px): '%s'",
+                  l, lang_key_name((tr_id_t)id), px, s);
+            if (id == TR_COMPOSE_MIC_IDLE || id == TR_COMPOSE_MIC_REC ||
+                id == TR_COMPOSE_MIC_LATCH || id == TR_COMPOSE_MIC_WAIT) {
+                CHECK(px <= VOICE_BAR_W,
+                      "lang %u mic bar key %s is %dpx (> %dpx): '%s'",
+                      l, lang_key_name((tr_id_t)id), px, VOICE_BAR_W, s);
+            }
+        }
+        // And the approval headline with both buttons appended fits 252 px.
+        chime_set_answer_buttons("START", "X");
+        chime_claude_state(3);
+        const int hpx = (int)lang_display_cols(chime_headline()) * 6;
+        CHECK(hpx <= 252,
+              "lang %u approval headline is %dpx (> 252px): '%s'",
+              l, hpx, chime_headline());
+    }
+
+    settings_set_camera_available(0);
+    chime_set_answer_buttons("A", "X");
+    chime_init();
+    lang_init();
+    reset_sound();
+}
+
+static void test_voice_adpcm_and_wire(void)
+{
+    voice_upload_t u;
+    voice_upload_init(&u);
+    static uint8_t buf[VOICE_BYTES_MAX];
+    int16_t pcm[1000];
+    for (int i = 0; i < 1000; i++) pcm[i] = (int16_t)((i * 300) % 12000 - 6000);
+
+    // 1000 samples -> 500 ADPCM bytes (> VOICE_CHUNK_MAX = 480).
+    CHECK(voice_upload_append(&u, buf, sizeof(buf), pcm, 1000) == 500 &&
+              u.total == 500 && u.peak_bars > 0,
+          "voice_upload_append did not produce 500 ADPCM bytes");
+
+    uint32_t offset = 999;
+    const uint8_t *data = NULL;
+    uint16_t len = 0;
+    // While recording=1, only full 480-byte chunks leave; the 20-byte tail waits.
+    CHECK(voice_upload_next_chunk(&u, buf, 1, &offset, &data, &len) &&
+              offset == 0 && len == VOICE_CHUNK_MAX,
+          "first voice chunk was not 480 bytes at offset 0");
+    CHECK(!voice_upload_next_chunk(&u, buf, 1, &offset, &data, &len),
+          "partial tail was sent while recording=1");
+    // Once recording=0, the 20-byte tail drains.
+    CHECK(voice_upload_next_chunk(&u, buf, 0, &offset, &data, &len) &&
+              offset == 480 && len == 20 && u.sent == 500,
+          "final 20-byte tail did not drain on stop");
+    CHECK(voice_upload_ack(&u, 480) && voice_upload_ack(&u, 500) &&
+              !voice_upload_ack(&u, 400) && !voice_upload_ack(&u, 501),
+          "voice_upload_ack did not enforce [acked, sent]");
+
+    // Wire codecs.
+    int can_stt = 0;
+    const uint8_t mr_ok[1] = { PROTO_MIC_CAN_TRANSCRIBE };
+    const uint8_t mr_bad[1] = { 0x02 };
+    CHECK(proto_decode_mic_ready(&can_stt, mr_ok, 1) == PROTO_OK && can_stt == 1 &&
+              proto_decode_mic_ready(&can_stt, mr_bad, 1) != PROTO_OK,
+          "proto_decode_mic_ready failed");
+
+    voice_text_t vt;
+    const uint8_t vt_ok[] = { VOICE_STATUS_OK, 0, 5, 'h', 'e', 'l', 'l', 'o' };
+    const uint8_t vt_bad[] = { VOICE_STATUS_OK, 0, 5, 'h', 0x01, 'l', 'l', 'o' };
+    CHECK(proto_decode_voice_text(&vt, vt_ok, sizeof(vt_ok)) == PROTO_OK &&
+              vt.status == VOICE_STATUS_OK && strcmp(vt.text, "hello") == 0,
+          "proto_decode_voice_text rejected valid text");
+    CHECK(proto_decode_voice_text(&vt, vt_bad, sizeof(vt_bad)) != PROTO_OK,
+          "proto_decode_voice_text accepted control byte");
+}
+
+static void test_voice_late_replies_are_tagged(void)
+{
+    voice_owed_t o;
+    voice_owed_init(&o);
+
+    // Nothing sent: an ack or a text answers nothing, and is no reason to
+    // drop anything.
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_UNEXPECTED &&
+              voice_owed_text(&o) == VOICE_REPLY_UNEXPECTED,
+          "a reply to nothing was taken as live");
+
+    // Utterance 1: three chunks, one acked, then X.
+    voice_owed_chunk(&o);
+    voice_owed_chunk(&o);
+    voice_owed_chunk(&o);
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_LIVE, "utterance 1's first ack");
+    voice_owed_abandon(&o);
+    CHECK(voice_owed_can_start(&o), "a cancel with no END blocked the next one");
+
+    // Utterance 2 starts and sends a chunk before the old acks arrive: the
+    // first two acks on the stream are utterance 1's and must not credit 2.
+    voice_owed_chunk(&o);
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_STALE &&
+              voice_owed_ack(&o) == VOICE_REPLY_STALE,
+          "a cancelled utterance's ack was credited to the next one");
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_LIVE, "utterance 2's own ack");
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_UNEXPECTED, "an extra ack was live");
+
+    // Utterance 2 ends and times out waiting: its text is owed, stale, and
+    // nothing new starts until it has arrived (a BUSY for a newer one could
+    // otherwise overtake it).
+    voice_owed_end(&o);
+    voice_owed_abandon(&o);
+    CHECK(!voice_owed_can_start(&o), "a new utterance raced an owed transcription");
+    CHECK(voice_owed_text(&o) == VOICE_REPLY_STALE, "the late text was live");
+    CHECK(voice_owed_can_start(&o), "the paid-off text still blocks");
+
+    // Utterance 3 runs to the end: its text is the live one, exactly once.
+    voice_owed_chunk(&o);
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_LIVE, "utterance 3's ack");
+    voice_owed_end(&o);
+    CHECK(voice_owed_text(&o) == VOICE_REPLY_LIVE, "utterance 3's text");
+    CHECK(voice_owed_text(&o) == VOICE_REPLY_UNEXPECTED, "a second text was live");
+
+    // Abandoning with nothing in flight changes nothing.
+    voice_owed_abandon(&o);
+    CHECK(o.acks_stale == 0 && o.texts_stale == 0 && voice_owed_can_start(&o),
+          "an idle cancel booked a debt");
+
+    // Dictation lands after what is written, one space apart, and only the
+    // bytes the keyboard could have typed.
+    composer_t c;
+    composer_init(&c);
+    CHECK(composer_append_text(&c, "hi", 2) == 0, "dictated into a closed composer");
+    composer_open(&c);
+    (void)composer_load(&c, "fix");
+    CHECK(composer_append_text(&c, "the bug", 7) == 7 &&
+              strcmp(c.body, "fix the bug") == 0,
+          "dictation was not joined with one space: '%s'", c.body);
+    const char hostile[] = { 'o', 'k', (char)0x9B, '2', 'J' };
+    CHECK(composer_append_text(&c, hostile, sizeof(hostile)) == 4 &&
+              memchr(c.body, 0x9B, c.len) == NULL,
+          "dictation put a C1 byte in the composer");
+}
+
+// Release 1.2's fixes, each against the pure half that decides it.
+static void test_voice_language_is_not_the_ui_language(void)
+{
+    // The server folds transcripts to ASCII: a CJK hint came back empty.
+    lang_init();
+    CHECK(!strcmp(lang_voice_code(LANG_EN), "en") &&
+              !strcmp(lang_voice_code(LANG_ES), "es"),
+          "a Latin-script language lost its own voice code");
+    CHECK(!strcmp(lang_voice_code(LANG_ZH), "en") &&
+              !strcmp(lang_voice_code(LANG_JA), "en"),
+          "ZH or JA asked the server for speech it cannot return");
+    char err[64];
+    const int fr = lang_load_text("code = fr\ncontrol.keys = CLAVIER\n", NULL,
+                                  err, sizeof(err));
+    const int tw = lang_load_text("code = zh-TW\ncontrol.keys = KEYS\n", NULL,
+                                  err, sizeof(err));
+    CHECK(fr >= 0 && tw >= 0, "packs did not load: %s", err);
+    CHECK(fr >= 0 && !strcmp(lang_voice_code((unsigned)fr), "fr"),
+          "a Latin custom pack lost its code");
+    CHECK(tw >= 0 && !strcmp(lang_voice_code((unsigned)tw), "en"),
+          "a zh-TW pack asked for Chinese speech");
+    lang_init();
+    const int ko = lang_load_text("code = ko\ncontrol.keys = KEYS\n", NULL, err,
+                                  sizeof(err));
+    const int zhx = lang_load_text("code = zhx\ncontrol.keys = KEYS\n", NULL, err,
+                                   sizeof(err));
+    CHECK(ko >= 0 && !strcmp(lang_voice_code((unsigned)ko), "en"),
+          "a Korean pack asked for Korean speech");
+    CHECK(zhx >= 0 && !strcmp(lang_voice_code((unsigned)zhx), "zhx"),
+          "a code merely starting zh was taken for Chinese");
+    CHECK(!strcmp(lang_voice_code(99), "en"), "an index past the end");
+    lang_init();
+}
+
+static void test_a_malformed_voice_reply_still_pays(void)
+{
+    // mic.c pays the ledger for a reply it could not decode exactly as for
+    // one it could: one VOICE_TEXT per VOICE_END, one ACK per CHUNK.
+    voice_owed_t o;
+    voice_owed_init(&o);
+    voice_owed_chunk(&o);
+    voice_owed_end(&o);
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_LIVE, "the live chunk's ack");
+    // The text arrives malformed: mic_text_malformed() books it all the same.
+    CHECK(voice_owed_text(&o) == VOICE_REPLY_LIVE && voice_owed_can_start(&o),
+          "a damaged transcription left the next recording refused");
+    // An abandoned utterance whose late text is malformed: still paid.
+    voice_owed_chunk(&o);
+    voice_owed_end(&o);
+    voice_owed_abandon(&o);
+    CHECK(!voice_owed_can_start(&o), "a stale text owed did not block");
+    CHECK(voice_owed_ack(&o) == VOICE_REPLY_STALE, "stale ack");
+    CHECK(voice_owed_text(&o) == VOICE_REPLY_STALE && voice_owed_can_start(&o),
+          "a damaged stale text did not unblock the microphone");
+}
+
+static void test_settings_values_fall_back_alone(void)
+{
+    // A file with an unknown value on most keys at once: each of those keys
+    // is its default, and every readable line beside them survives.
+    lang_init();
+    settings_t s;
+    char err[64];
+    const char file[] =
+        "version=4\n"
+        "model=gpt\nboot=keys\nsound=loud\nvolume=high\nblips=lots\n"
+        "typing=off\ntheme=purple\nlang=fr\nautoconnect=maybe\n"
+        "addresses=blur\nviewtaps=on\ngod_mode=perhaps\nbutton_a=jump\n"
+        "button_b=tab\nshutter=x\npicture=huge\nliveview=sepia\nmic_mode=latch\n";
+    CHECK(settings_parse(file, &s, err, sizeof(err)), "refused: %s", err);
+    settings_t d;
+    settings_defaults(&d);
+    CHECK(s.model == d.model && s.sound == d.sound && s.blips == d.blips &&
+              s.theme == d.theme && s.language == LANG_EN &&
+              s.autoconnect == d.autoconnect &&
+              s.hide_addresses == d.hide_addresses && s.god_mode == 0 &&
+              s.buttons.action[BUTTON_A] == d.buttons.action[BUTTON_A] &&
+              s.camera_shutter == d.camera_shutter && s.picture == d.picture &&
+              s.liveview == d.liveview,
+          "an unknown value did not fall back to its own default");
+    CHECK(s.boot == SETTINGS_BOOT_KEYS && s.volume == SETTINGS_VOLUME_HIGH &&
+              s.typing == 0 && s.view_taps == 1 &&
+              s.buttons.action[BUTTON_B] == BUTTON_TAB &&
+              s.mic_mode == SETTINGS_MIC_LATCH,
+          "an unknown value elsewhere cost a good line");
+
+    // Saved with a custom pack chosen, read back after the pack is gone.
+    const int fr = lang_load_text("code = fr\ncontrol.keys = CLAVIER\n", NULL,
+                                  err, sizeof(err));
+    CHECK(fr >= 0, "pack: %s", err);
+    settings_defaults(&s);
+    s.language = (unsigned)fr;
+    s.theme = SETTINGS_THEME_MOSS;
+    s.buttons.action[BUTTON_Y] = BUTTON_STOP;
+    static const char path[] = "/tmp/dsterm-removed-pack.cfg";
+    CHECK(settings_save(path, &s, err, sizeof(err)), "save: %s", err);
+    lang_init();    // the SD card no longer has fr.lang
+    settings_t back;
+    CHECK(settings_load(path, &back, err, sizeof(err)) &&
+              back.language == LANG_EN && back.theme == SETTINGS_THEME_MOSS &&
+              back.buttons.action[BUTTON_Y] == BUTTON_STOP,
+          "a removed pack's lang= cost more than the language: %s", err);
+    remove(path);
+}
+
+static void test_custom_pack_cut_on_a_character(void)
+{
+    // 21 three-byte characters is 63 bytes, LANG_STR_MAX exactly; one more
+    // ASCII byte before them leaves the 21st cut in half.
+    lang_init();
+    static char text[256];
+    char val[80];
+    size_t k = 0;
+    val[k++] = 'x';
+    for (int i = 0; i < 21; i++) {
+        memcpy(val + k, "\xe9\x80\x81", 3);     // 送
+        k += 3;
+    }
+    val[k] = '\0';
+    snprintf(text, sizeof(text), "code = qq\ncontrol.keys = %s\n", val);
+    char err[64];
+    const int qq = lang_load_text(text, NULL, err, sizeof(err));
+    CHECK(qq >= 0, "pack: %s", err);
+    const char *got = lang_tr_at((unsigned)qq, TR_CONTROL_KEYS);
+    CHECK(strlen(got) == 61 && !strncmp(got, val, 61),
+          "a long value was cut inside a character (%zu bytes)", strlen(got));
+    // A value that fits keeps every byte.
+    snprintf(text, sizeof(text), "code = qr\ncontrol.keys = %s\n", val + 1);
+    const int qr = lang_load_text(text, NULL, err, sizeof(err));
+    CHECK(qr >= 0 && strlen(lang_tr_at((unsigned)qr, TR_CONTROL_KEYS)) == 63,
+          "a value of exactly LANG_STR_MAX bytes was cut");
+    lang_init();
+}
+
+static void test_voice_bar_edges_and_guide_context(void)
+{
+    CHECK(voice_bar_hit(VOICE_BAR_X, VOICE_BAR_Y) &&
+              voice_bar_hit(VOICE_BAR_X + VOICE_BAR_W - 1,
+                            VOICE_BAR_Y + VOICE_BAR_H - 1),
+          "the MIC bar's corners are not the bar");
+    CHECK(!voice_bar_hit(VOICE_BAR_X - 1, VOICE_BAR_Y) &&
+              !voice_bar_hit(VOICE_BAR_X + VOICE_BAR_W, VOICE_BAR_Y) &&
+              !voice_bar_hit(VOICE_BAR_X, VOICE_BAR_Y - 1) &&
+              !voice_bar_hit(VOICE_BAR_X, VOICE_BAR_Y + VOICE_BAR_H),
+          "a pixel just outside the MIC bar hit it");
+    CHECK(guide_ctx_for(0, 0, 0) == GUIDE_CTX_CONTROL &&
+              guide_ctx_for(1, 0, 0) == GUIDE_CTX_KEYS &&
+              guide_ctx_for(0, 1, 0) == GUIDE_CTX_CONTROL &&
+              guide_ctx_for(1, 1, 0) == GUIDE_CTX_KEYS,
+          "the guide opened on the wrong screen's tab");
+    CHECK(guide_ctx_for(0, 0, 1) == GUIDE_CTX_QUICK &&
+              guide_ctx_for(1, 1, 1) == GUIDE_CTX_QUICK,
+          "QUICK open did not open the guide on QUICK");
+
+    // The pop-up names a mapped button's action as a whole word; the drawing
+    // keeps English's "ENT" and shows a translation's own word.
+    lang_init();
+    button_map_t map;
+    button_map_defaults(&map);
+    guide_config_t cfg = { &map, SHUTTER_R, 1, 1, 1 };
+    const guide_entry_t e = guide_entry(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A, 0);
+    char name[GUIDE_LINE_MAX];
+    guide_entry_texts(&e, NULL, 0, name, sizeof(name), NULL, 0);
+    CHECK(!strcmp(name, "ENTER"), "EN pop-up name '%s'", name);
+    lang_set_current(LANG_ES);
+    guide_entry_texts(&e, NULL, 0, name, sizeof(name), NULL, 0);
+    CHECK(!strcmp(name, "INTRO") &&
+              !strcmp(guide_button_label(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A),
+                      "INTRO"),
+          "ES pop-up name '%s'", name);
+    lang_set_current(LANG_JA);
+    CHECK(!strcmp(guide_button_label(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A),
+                  "決定"),
+          "JA drawing kept the English abbreviation");
+    lang_init();
+}
+
+static void test_quick_files_reject_what_they_cannot_read(void)
+{
+    static quick_saved_t s;
+    // Unknown and dangling escapes skip their line, and only theirs.
+    quick_saved_parse(&s, "one\nbad \\t escape\ntwo\\\\ok\nend\\");
+    CHECK(s.count == 2 && !strcmp(s.items[0], "one") &&
+              !strcmp(s.items[1], "two\\ok"),
+          "bad escapes: %u items", s.count);
+    // CRLF reads like LF; "\\n" is a newline inside an entry.
+    quick_saved_parse(&s, "first\r\nsecond\\nline\r\n");
+    CHECK(s.count == 2 && !strcmp(s.items[0], "first") &&
+              !strcmp(s.items[1], "second\nline"),
+          "CRLF: %u items, '%s'", s.count, s.items[0]);
+    // A line longer than an entry may be is skipped whole, not cut.
+    static char big[QUICK_SAVED_TEXT_MAX + 40];
+    memset(big, 'a', QUICK_SAVED_TEXT_MAX + 1);
+    memcpy(big + QUICK_SAVED_TEXT_MAX + 1, "\nshort\n", 8);
+    quick_saved_parse(&s, big);
+    CHECK(s.count == 1 && !strcmp(s.items[0], "short"),
+          "an over-long saved line: %u items", s.count);
+    // Exactly the limit is kept.
+    big[QUICK_SAVED_TEXT_MAX] = '\n';
+    big[QUICK_SAVED_TEXT_MAX + 1] = '\0';
+    quick_saved_parse(&s, big);
+    CHECK(s.count == 1 && strlen(s.items[0]) == QUICK_SAVED_TEXT_MAX,
+          "a saved line of exactly the limit was refused");
+    // And format writes what parse reads, escapes included.
+    static char out[QUICK_SAVED_MAX * (2 * QUICK_SAVED_TEXT_MAX + 2) + 1];
+    quick_saved_init(&s);
+    (void)quick_saved_add(&s, "a\\b\nc");
+    CHECK(quick_saved_format(&s, out, sizeof(out)) && !strcmp(out, "a\\\\b\\nc\n"),
+          "format: '%s'", out);
+    CHECK(quick_saved_format(&s, out, 8) == 0, "a format that did not fit said it did");
+
+    static quick_recent_t r;
+    memset(big, 'b', QUICK_RECENT_TEXT_MAX + 1);
+    memcpy(big + QUICK_RECENT_TEXT_MAX + 1, "\r\nkept\r\n", 9);
+    quick_recent_parse(&r, big);
+    CHECK(r.count == 1 && !strcmp(r.items[0], "kept"),
+          "an over-long AGAIN line: %u items", r.count);
+}
+
+static void test_an_empty_enter_is_not_a_send(void)
+{
+    // Pressing A (Enter) on nothing must not sound SENT or start the thinking
+    // arc: that played whole "requests" that never were.
+    chime_init();
+    CHECK(!chime_typed("\r", 1) && !chime_typed("\r", 1),
+          "an Enter on an empty line counted as a send");
+    CHECK(!chime_typed("fix it", 6) && chime_typed("\r", 1),
+          "a typed line's Enter was not a send");
+    CHECK(!chime_typed("\r", 1), "a second Enter after a send counted again");
+    CHECK(!chime_typed("a", 1) && !chime_typed("\x7f", 1) && !chime_typed("\r", 1),
+          "a line typed and deleted again counted as a send");
+    CHECK(!chime_typed("\x1b[C", 3) && !chime_typed("\x1b", 1) &&
+              !chime_typed("\x1b[D", 3) && !chime_typed("\r", 1),
+          "Left, Right or Escape counted as typed text");
+    // Up and Down recall history into the line: Enter after one sends it.
+    CHECK(!chime_typed("\x1b[A", 3) && chime_typed("\r", 1),
+          "Enter after Up-arrow recall was not a send");
+    CHECK(!chime_typed("\x1bOB", 3) && chime_typed("\r", 1),
+          "Enter after an application-mode Down was not a send");
+    // LF is a newline inside Claude Code's prompt, not a submit: a composer
+    // body ending in one (sent as its own frame, or with the text) still
+    // cues SENT on the CR that follows.
+    CHECK(!chime_typed("two\nlines\n", 10) && chime_typed("\r", 1),
+          "a body ending in LF was not a send");
+    CHECK(!chime_typed("x", 1) && !chime_typed("\n", 1) && chime_typed("\r", 1),
+          "an LF frame cleared the line");
+    CHECK(!chime_typed("\n", 1) && !chime_typed("\r", 1),
+          "a body of nothing but LF counted as a send");
+    CHECK(!chime_typed("half", 4) && !chime_typed("\x03", 1) && !chime_typed("\r", 1),
+          "Ctrl-C did not clear the line");
+    // Answering a question Claude asked is a send even with nothing typed.
+    chime_claude_state(3);
+    CHECK(chime_typed("\r", 1), "Enter on an approval was not a send");
+    chime_claude_state(1);
+    // A new connection starts with nothing typed.
+    (void)chime_typed("x", 1);
+    chime_claude_reset();
+    CHECK(!chime_typed("\r", 1), "typed text survived a reconnect");
+    chime_init();
+}
+
+static void test_voice_ptt_focus_order(void)
+{
+    // Which shoulder came first decides what L+R means in the composer, so
+    // focus and the microphone never collide.
+    for (int latch = 0; latch <= 1; latch++) {
+        voice_ptt_t p;
+        voice_ptt_init(&p);
+        // L first, held a while, then R: focus, in either mic mode.
+        CHECK(voice_ptt_step(&p, latch, 0, 1, 0, 1, 0, 0, 0, 0) == VOICE_PTT_NONE &&
+                  voice_ptt_step(&p, latch, 0, 1, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+              "L alone did something (latch=%d)", latch);
+        CHECK(voice_ptt_step(&p, latch, 1, 1, 1, 0, 0, 0, 0, 0) == VOICE_PTT_FOCUS &&
+                  !p.chord_notice,
+              "L then R was not focus (latch=%d)", latch);
+        // Holding both on, then L let go with R still down: never the mic.
+        for (unsigned i = 0; i < 2 * VOICE_HOLD_FRAMES; i++) {
+            CHECK(voice_ptt_step(&p, latch, 1, i < 3, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+                  "the focus chord's R started the mic at frame %u (latch=%d)", i, latch);
+        }
+        CHECK(voice_ptt_step(&p, latch, 0, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE &&
+                  !p.wait_release,
+              "releasing after the focus chord did not settle (latch=%d)", latch);
+
+        // Both landing in one frame: focus too -- the mic needs R alone.
+        CHECK(voice_ptt_step(&p, latch, 1, 1, 1, 1, 0, 0, 0, 0) == VOICE_PTT_FOCUS,
+              "a simultaneous L+R was not focus (latch=%d)", latch);
+        (void)voice_ptt_step(&p, latch, 0, 0, 0, 0, 0, 0, 0, 0);
+
+        // R first (not yet recording), then L: not focus -- the notice says
+        // which order is.
+        CHECK(voice_ptt_step(&p, latch, 1, 0, 1, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+              "R's first frame did something (latch=%d)", latch);
+        CHECK(voice_ptt_step(&p, latch, 1, 1, 0, 1, 0, 0, 0, 0) == VOICE_PTT_NONE &&
+                  p.chord_notice,
+              "R then L without a recording was not the notice (latch=%d)", latch);
+        (void)voice_ptt_step(&p, latch, 0, 0, 0, 0, 0, 0, 0, 0);
+    }
+}
+
+// ------------------------------------------------------------ CONTROLS ---
+
+// Feed guide_step() a run of held key words, one per frame, as poll_input
+// does: the edge is what was not held the frame before.
+static guide_step_t guide_feed(guide_t *g, const guide_config_t *cfg,
+                               const unsigned *held, unsigned n)
+{
+    unsigned prev = 0;
+    guide_step_t last = GUIDE_STEP_NONE;
+    for (unsigned i = 0; i < n; i++) {
+        const guide_step_t s = guide_step(g, cfg, held[i], held[i] & ~prev);
+        if (s != GUIDE_STEP_NONE) last = s;
+        prev = held[i];
+    }
+    return last;
+}
+
+static void test_guide_every_combo_in_every_context(void)
+{
+    lang_init();
+    button_map_t map;
+    button_map_defaults(&map);
+    guide_config_t cfg = { &map, SHUTTER_R, 0, 1, 1 };
+    for (int c = 0; c < GUIDE_CTX_COUNT; c++) {
+        for (int k = GUIDE_COMBO_A; k < GUIDE_COMBO_COUNT; k++) {
+            for (int rec = 0; rec < 2; rec++) {
+                const guide_entry_t e = guide_entry((guide_ctx_t)c, &cfg,
+                                                    (guide_combo_t)k, rec);
+                CHECK(e.what < TR_COUNT, "ctx %d combo %d has no text", c, k);
+                CHECK(e.name < TR_COUNT || e.action < BUTTON_ACTION_COUNT,
+                      "ctx %d combo %d has no name", c, k);
+                // A mapped name only where the mapping applies.
+                CHECK(e.name != TR_COUNT ||
+                          c == GUIDE_CTX_CONTROL || c == GUIDE_CTX_KEYS,
+                      "ctx %d combo %d reads the face map outside CONTROL/KEYS", c, k);
+                char combo[GUIDE_LINE_MAX], name[GUIDE_LINE_MAX], what[GUIDE_LINE_MAX];
+                guide_entry_texts(&e, combo, sizeof(combo), name, sizeof(name),
+                                  what, sizeof(what));
+                CHECK(combo[0] && name[0] && what[0],
+                      "ctx %d combo %d has an empty line", c, k);
+            }
+        }
+    }
+
+    // Never an action for a context it does not apply to.  The composer's
+    // shoulder combos are the composer's; the shutter is the camera's;
+    // Shift-Tab is the Control and KEYS screens'.
+    static const guide_combo_t COMPOSER_ONLY[] = {
+        GUIDE_COMBO_HOLD_R, GUIDE_COMBO_R_THEN_L, GUIDE_COMBO_L_THEN_R,
+    };
+    static const guide_ctx_t NOT_COMPOSER[] = {
+        GUIDE_CTX_CONTROL, GUIDE_CTX_KEYS, GUIDE_CTX_CAMERA, GUIDE_CTX_QUICK,
+    };
+    for (size_t i = 0; i < sizeof(NOT_COMPOSER) / sizeof(NOT_COMPOSER[0]); i++) {
+        for (size_t j = 0; j < sizeof(COMPOSER_ONLY) / sizeof(COMPOSER_ONLY[0]); j++) {
+            const guide_entry_t e = guide_entry(NOT_COMPOSER[i], &cfg, COMPOSER_ONLY[j], 1);
+            CHECK(e.what == TR_GUIDE_DO_NOTHING,
+                  "composer combo %d acts in ctx %d", COMPOSER_ONLY[j], NOT_COMPOSER[i]);
+        }
+    }
+    static const guide_ctx_t NOT_CAMERA[] = {
+        GUIDE_CTX_CONTROL, GUIDE_CTX_KEYS, GUIDE_CTX_COMPOSE, GUIDE_CTX_FOCUS,
+        GUIDE_CTX_QUICK,
+    };
+    for (size_t i = 0; i < sizeof(NOT_CAMERA) / sizeof(NOT_CAMERA[0]); i++) {
+        CHECK(guide_entry(NOT_CAMERA[i], &cfg, GUIDE_COMBO_SHUTTER, 0).what ==
+                  TR_GUIDE_DO_NOTHING,
+              "the shutter acts in ctx %d", NOT_CAMERA[i]);
+    }
+    for (int c = GUIDE_CTX_COMPOSE; c < GUIDE_CTX_COUNT; c++) {
+        CHECK(guide_entry((guide_ctx_t)c, &cfg, GUIDE_COMBO_SHIFT_TAB, 0).what ==
+                  TR_GUIDE_DO_NOTHING,
+              "Shift-Tab acts in ctx %d", c);
+    }
+    // No camera: no CAMERA context, and nothing in it if asked anyway.
+    cfg.camera = 0;
+    CHECK(!guide_ctx_present(GUIDE_CTX_CAMERA, &cfg) &&
+              guide_ctx_step(GUIDE_CTX_FOCUS, 1, &cfg) == GUIDE_CTX_QUICK &&
+              guide_ctx_step(GUIDE_CTX_QUICK, -1, &cfg) == GUIDE_CTX_FOCUS,
+          "a card without a camera still steps onto CAMERA");
+    for (int k = GUIDE_COMBO_A; k < GUIDE_COMBO_INTRO; k++) {
+        CHECK(guide_entry(GUIDE_CTX_CAMERA, &cfg, (guide_combo_t)k, 0).what ==
+                  TR_GUIDE_DO_NOTHING,
+              "CAMERA without a camera explains combo %d", k);
+    }
+    int x, y, w, h;
+    CHECK(!guide_tab_rect(GUIDE_CTX_CAMERA, &cfg, &x, &y, &w, &h),
+          "a card without a camera has a CAMERA tab");
+    guide_t g;
+    guide_init(&g, GUIDE_CTX_CAMERA, &cfg);
+    CHECK(g.ctx == GUIDE_CTX_CONTROL, "the guide opened on an absent CAMERA");
+    cfg.camera = 1;
+
+    // The real keys, context by context.
+    CHECK(guide_entry(GUIDE_CTX_KEYS, &cfg, GUIDE_COMBO_X, 0).what == TR_GUIDE_DO_X_BACK,
+          "KEYS' X is not back (status_mode_back swallows it)");
+    CHECK(guide_entry(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_X, 0).what == TR_GUIDE_DO_ESC,
+          "Control's X does not send its mapped Esc");
+    CHECK(guide_entry(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_START, 0).what == TR_GUIDE_DO_STOP,
+          "START is not stop, as mapped");
+    CHECK(guide_entry(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_SELECT, 0).what == TR_GUIDE_DO_SELECT &&
+              guide_entry(GUIDE_CTX_QUICK, &cfg, GUIDE_COMBO_SELECT, 0).what == TR_GUIDE_DO_NOTHING,
+          "SELECT cycles where it does, and only there");
+    CHECK(guide_entry(GUIDE_CTX_COMPOSE, &cfg, GUIDE_COMBO_A, 0).what == TR_GUIDE_DO_SEND &&
+              guide_entry(GUIDE_CTX_COMPOSE, &cfg, GUIDE_COMBO_Y, 0).what == TR_GUIDE_DO_SNIPPETS &&
+              guide_entry(GUIDE_CTX_COMPOSE, &cfg, GUIDE_COMBO_X, 0).what == TR_GUIDE_DO_CLOSE &&
+              guide_entry(GUIDE_CTX_COMPOSE, &cfg, GUIDE_COMBO_X, 1).what == TR_GUIDE_DO_MIC_CANCEL,
+          "the composer's A, Y and X are wrong");
+    CHECK(guide_entry(GUIDE_CTX_FOCUS, &cfg, GUIDE_COMBO_A, 0).what == TR_GUIDE_DO_TYPE &&
+              guide_entry(GUIDE_CTX_FOCUS, &cfg, GUIDE_COMBO_START, 0).what == TR_GUIDE_DO_FOCUS_SEND &&
+              guide_entry(GUIDE_CTX_FOCUS, &cfg, GUIDE_COMBO_X, 0).what == TR_GUIDE_DO_FOCUS_OUT &&
+              guide_entry(GUIDE_CTX_FOCUS, &cfg, GUIDE_COMBO_DPAD, 0).what == TR_GUIDE_DO_MOVE_KEYS,
+          "FOCUS is not A types, START sends, X leaves, the d-pad moves");
+    CHECK(guide_entry(GUIDE_CTX_CAMERA, &cfg, GUIDE_COMBO_LR, 0).what == TR_GUIDE_DO_CAM_LEAVE &&
+              guide_entry(GUIDE_CTX_CAMERA, &cfg, GUIDE_COMBO_R, 0).combo == GUIDE_COMBO_SHUTTER,
+          "the camera's L+R and shutter are wrong");
+    lang_init();
+}
+
+static void test_guide_mapping_and_order(void)
+{
+    lang_init();
+    button_map_t map;
+    button_map_defaults(&map);
+    guide_config_t cfg = { &map, SHUTTER_R, 0, 1, 1 };
+    guide_t g;
+
+    // A remapped A changes the A entry, and the drawing's label, at once.
+    CHECK(!strcmp(guide_button_label(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A), "ENT"),
+          "A's label is not ENT by default");
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    static const unsigned press_a[] = { GUIDE_KEY_A };
+    CHECK(guide_feed(&g, &cfg, press_a, 1) == GUIDE_STEP_SHOW &&
+              g.entry.action == BUTTON_ENTER && g.entry.what == TR_GUIDE_DO_ENTER,
+          "A does not show Enter");
+    // Enter has to stay on some button: B takes it first.
+    CHECK(button_map_set(&map, BUTTON_B, BUTTON_ENTER) &&
+              button_map_set(&map, BUTTON_A, BUTTON_SPACE), "could not remap A");
+    CHECK(!strcmp(guide_button_label(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A), "SPC"),
+          "a remapped A still says '%s'",
+          guide_button_label(GUIDE_CTX_CONTROL, &cfg, GUIDE_COMBO_A));
+    guide_init(&g, GUIDE_CTX_KEYS, &cfg);
+    (void)guide_feed(&g, &cfg, press_a, 1);
+    CHECK(g.entry.action == BUTTON_SPACE && g.entry.what == TR_GUIDE_DO_SPACE,
+          "a remapped A does not show Space");
+    // ...but not in the composer, which keeps its own keys.
+    CHECK(guide_entry(GUIDE_CTX_COMPOSE, &cfg, GUIDE_COMBO_A, 0).what == TR_GUIDE_DO_SEND,
+          "the mapping reached the composer");
+    button_map_defaults(&map);
+
+    // R, then the Tab button: Shift-Tab, named after whichever button has Tab.
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    static const unsigned r_then_y[] = { GUIDE_KEY_R, 0, GUIDE_KEY_Y };
+    (void)guide_feed(&g, &cfg, r_then_y, 3);
+    char combo[GUIDE_LINE_MAX], name[GUIDE_LINE_MAX], what[GUIDE_LINE_MAX];
+    guide_entry_texts(&g.entry, combo, sizeof(combo), name, sizeof(name),
+                      what, sizeof(what));
+    CHECK(g.entry.combo == GUIDE_COMBO_SHIFT_TAB && !strcmp(combo, "R, then Y"),
+          "R then Y is '%s'", combo);
+    static const unsigned y_alone[] = { GUIDE_KEY_Y };
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    (void)guide_feed(&g, &cfg, y_alone, 1);
+    CHECK(g.entry.combo == GUIDE_COMBO_Y && g.entry.action == BUTTON_TAB,
+          "Y alone is not Tab");
+    (void)button_map_set(&map, BUTTON_Y, BUTTON_SPACE);
+    (void)button_map_set(&map, BUTTON_B, BUTTON_TAB);
+    static const unsigned r_then_b[] = { GUIDE_KEY_R, 0, GUIDE_KEY_B };
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    (void)guide_feed(&g, &cfg, r_then_b, 3);
+    guide_entry_texts(&g.entry, combo, sizeof(combo), NULL, 0, NULL, 0);
+    CHECK(g.entry.combo == GUIDE_COMBO_SHIFT_TAB && !strcmp(combo, "R, then B"),
+          "Tab moved to B, but R then B is '%s'", combo);
+    button_map_defaults(&map);
+
+    // L+R on Control: focus, whichever lands first.
+    static const unsigned l_r[] = { GUIDE_KEY_L, GUIDE_KEY_L | GUIDE_KEY_R };
+    static const unsigned r_l[] = { GUIDE_KEY_R, GUIDE_KEY_L | GUIDE_KEY_R };
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    (void)guide_feed(&g, &cfg, l_r, 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_LR && g.entry.what == TR_GUIDE_DO_FOCUS_TILES,
+          "L+R on Control is not focus");
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    (void)guide_feed(&g, &cfg, r_l, 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_LR, "R+L on Control is not focus");
+
+    // COMPOSE: which shoulder came first is voice_ptt_step's decision.
+    guide_init(&g, GUIDE_CTX_COMPOSE, &cfg);
+    (void)guide_feed(&g, &cfg, l_r, 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_L_THEN_R && g.entry.what == TR_GUIDE_DO_FOCUS,
+          "L then R in the composer is not focus");
+    guide_init(&g, GUIDE_CTX_COMPOSE, &cfg);
+    (void)guide_feed(&g, &cfg, r_l, 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_R_THEN_L && g.entry.what == TR_GUIDE_DO_ORDER,
+          "R then L, nothing recording, is not the order notice");
+    // Hold R past VOICE_HOLD_FRAMES: talk; then L latches or cancels.
+    unsigned hold[VOICE_HOLD_FRAMES + 2];
+    for (unsigned i = 0; i < VOICE_HOLD_FRAMES + 1; i++) hold[i] = GUIDE_KEY_R;
+    hold[VOICE_HOLD_FRAMES + 1] = GUIDE_KEY_R | GUIDE_KEY_L;
+    guide_init(&g, GUIDE_CTX_COMPOSE, &cfg);
+    (void)guide_feed(&g, &cfg, hold, VOICE_HOLD_FRAMES + 1);
+    CHECK(g.entry.combo == GUIDE_COMBO_HOLD_R && g.entry.what == TR_GUIDE_DO_TALK &&
+              g.recording,
+          "holding R is not talk");
+    guide_init(&g, GUIDE_CTX_COMPOSE, &cfg);
+    (void)guide_feed(&g, &cfg, hold, VOICE_HOLD_FRAMES + 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_R_THEN_L && g.entry.what == TR_GUIDE_DO_HOLD_CANCEL &&
+              !g.recording,
+          "R then L while recording (HOLD) is not cancel");
+    cfg.latch = 1;
+    guide_init(&g, GUIDE_CTX_FOCUS, &cfg);
+    (void)guide_feed(&g, &cfg, hold, VOICE_HOLD_FRAMES + 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_R_THEN_L && g.entry.what == TR_GUIDE_DO_LATCH &&
+              g.recording,
+          "R then L while recording (LATCH) is not the latch");
+    cfg.latch = 0;
+    // No speech-to-text: holding R says so, and R then L is only the notice.
+    cfg.talk = 0;
+    guide_init(&g, GUIDE_CTX_COMPOSE, &cfg);
+    (void)guide_feed(&g, &cfg, hold, VOICE_HOLD_FRAMES + 1);
+    CHECK(g.entry.what == TR_GUIDE_DO_TALK_OFF && !g.recording,
+          "talk started without speech-to-text");
+    cfg.talk = 1;
+
+    // CAMERA: the shutter follows the setting; L+R leaves.
+    cfg.shutter = SHUTTER_A;
+    guide_init(&g, GUIDE_CTX_CAMERA, &cfg);
+    (void)guide_feed(&g, &cfg, press_a, 1);
+    CHECK(g.entry.combo == GUIDE_COMBO_SHUTTER, "A as the shutter is not the shutter");
+    static const unsigned press_r[] = { GUIDE_KEY_R };
+    guide_init(&g, GUIDE_CTX_CAMERA, &cfg);
+    (void)guide_feed(&g, &cfg, press_r, 1);
+    CHECK(g.entry.what == TR_GUIDE_DO_NOTHING, "R took a picture with A as the shutter");
+    cfg.shutter = SHUTTER_R;
+    guide_init(&g, GUIDE_CTX_CAMERA, &cfg);
+    (void)guide_feed(&g, &cfg, r_l, 2);
+    CHECK(g.entry.combo == GUIDE_COMBO_LR && g.entry.what == TR_GUIDE_DO_CAM_LEAVE,
+          "L+R on the camera does not leave");
+
+    // The ways out, from any context; and left/right pick the context.
+    for (int c = 0; c < GUIDE_CTX_COUNT; c++) {
+        static const unsigned sel_start[] = { GUIDE_KEY_SELECT,
+                                              GUIDE_KEY_SELECT | GUIDE_KEY_START };
+        guide_init(&g, (guide_ctx_t)c, &cfg);
+        CHECK(guide_feed(&g, &cfg, sel_start, 2) == GUIDE_STEP_LEAVE,
+              "SELECT+START does not leave ctx %d", c);
+        guide_init(&g, (guide_ctx_t)c, &cfg);
+        unsigned prev = 0;
+        guide_step_t s = GUIDE_STEP_NONE;
+        unsigned frames = 0;
+        while (s != GUIDE_STEP_LEAVE && frames < 200) {
+            s = guide_step(&g, &cfg, GUIDE_KEY_B, GUIDE_KEY_B & ~prev);
+            prev = GUIDE_KEY_B;
+            frames++;
+        }
+        CHECK(frames == GUIDE_B_HOLD_FRAMES, "B held left ctx %d after %u frames", c, frames);
+    }
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    static const unsigned right[] = { GUIDE_KEY_RIGHT };
+    CHECK(guide_feed(&g, &cfg, right, 1) == GUIDE_STEP_CONTEXT && g.ctx == GUIDE_CTX_KEYS,
+          "RIGHT did not move to KEYS");
+
+    // The pop-up: the opening one waits, the rest go after three seconds.
+    guide_init(&g, GUIDE_CTX_CONTROL, &cfg);
+    for (unsigned i = 0; i < GUIDE_POPUP_FRAMES * 2; i++) (void)guide_tick(&g);
+    CHECK(g.shown && g.entry.combo == GUIDE_COMBO_INTRO, "the opening pop-up timed out");
+    (void)guide_feed(&g, &cfg, press_a, 1);
+    unsigned t = 0;
+    while (!guide_tick(&g) && t < 1000) t++;
+    CHECK(!g.shown && t + 1 == GUIDE_POPUP_FRAMES, "a pop-up stayed %u frames", t + 1);
+    lang_init();
+}
+
+static void test_guide_text_and_geometry_fit(void)
+{
+    lang_init();
+    button_map_t map;
+    button_map_defaults(&map);
+    guide_config_t cfg = { &map, SHUTTER_R, 1, 1, 1 };
+
+    char lines[2][GUIDE_LINE_MAX];
+    CHECK(guide_wrap("aaa bbb", 3, lines) == 2 && !strcmp(lines[0], "aaa") &&
+              !strcmp(lines[1], "bbb"),
+          "wrap: '%s' '%s'", lines[0], lines[1]);
+    CHECK(guide_wrap("aaaa bbbb cccc", 4, lines) == 0, "three lines fit in two");
+    CHECK(guide_wrap("按住录音", 4, lines) == 2 && !strcmp(lines[0], "按住"),
+          "CJK did not break between characters: '%s'", lines[0]);
+
+    for (unsigned l = 0; l < LANG_BUILTIN_COUNT; l++) {
+        lang_set_current(l);
+        const char *code = lang_code(l);
+        // Every pop-up, in every context: three or four lines in the box.
+        for (int c = 0; c < GUIDE_CTX_COUNT; c++) {
+            for (int k = GUIDE_COMBO_A; k < GUIDE_COMBO_COUNT; k++) {
+                for (int rec = 0; rec < 2; rec++) {
+                    const guide_entry_t e = guide_entry((guide_ctx_t)c, &cfg,
+                                                        (guide_combo_t)k, rec);
+                    char combo[GUIDE_LINE_MAX], name[GUIDE_LINE_MAX], what[GUIDE_LINE_MAX];
+                    guide_entry_texts(&e, combo, sizeof(combo), name, sizeof(name),
+                                      what, sizeof(what));
+                    CHECK(lang_display_cols(combo) <= GUIDE_POPUP_COLS &&
+                              lang_display_cols(name) <= GUIDE_POPUP_COLS,
+                          "%s ctx %d combo %d: '%s' / '%s' wider than the box",
+                          code, c, k, combo, name);
+                    CHECK(guide_wrap(what, GUIDE_POPUP_COLS, lines) != 0,
+                          "%s ctx %d combo %d: '%s' is more than two lines",
+                          code, c, k, what);
+                }
+            }
+            // The drawing's labels: face legend "X label" in 11 columns,
+            // the d-pad's in 11, START's and SELECT's in 10, the shoulders'
+            // "L label" in the 92-pixel tab.
+            static const guide_combo_t FACE[] = {
+                GUIDE_COMBO_A, GUIDE_COMBO_B, GUIDE_COMBO_X, GUIDE_COMBO_Y,
+            };
+            for (size_t i = 0; i < 4; i++) {
+                const char *s = guide_button_label((guide_ctx_t)c, &cfg, FACE[i]);
+                CHECK(lang_display_cols(s) <= 9, "%s ctx %d face label '%s' too wide",
+                      code, c, s);
+            }
+            const char *s = guide_button_label((guide_ctx_t)c, &cfg, GUIDE_COMBO_DPAD);
+            CHECK(lang_display_cols(s) <= 11, "%s ctx %d d-pad label '%s'", code, c, s);
+            s = guide_button_label((guide_ctx_t)c, &cfg, GUIDE_COMBO_START);
+            CHECK(lang_display_cols(s) <= 10, "%s ctx %d START label '%s'", code, c, s);
+            s = guide_button_label((guide_ctx_t)c, &cfg, GUIDE_COMBO_SELECT);
+            CHECK(lang_display_cols(s) <= 10, "%s ctx %d SELECT label '%s'", code, c, s);
+            s = guide_button_label((guide_ctx_t)c, &cfg, GUIDE_COMBO_L);
+            CHECK(lang_display_cols(s) + 2 <= (92 - 8) / 6, "%s ctx %d L label '%s'", code, c, s);
+            s = guide_button_label((guide_ctx_t)c, &cfg, GUIDE_COMBO_R);
+            CHECK(lang_display_cols(s) + 2 <= (92 - 8) / 6, "%s ctx %d R label '%s'", code, c, s);
+        }
+        // Tabs: in order, apart, each wide enough for its label, on screen.
+        for (int cam = 0; cam < 2; cam++) {
+            cfg.camera = cam;
+            int prev_right = -1;
+            for (int c = 0; c < GUIDE_CTX_COUNT; c++) {
+                int x, y, w, h;
+                if (!guide_tab_rect((guide_ctx_t)c, &cfg, &x, &y, &w, &h)) continue;
+                const int need = (int)lang_display_cols(tr(guide_ctx_label((guide_ctx_t)c))) * 6 + 4;
+                CHECK(x > prev_right && w >= need && x + w <= 256,
+                      "%s tab %d at %d+%d (needs %d, previous ends %d)",
+                      code, c, x, w, need, prev_right);
+                CHECK(guide_tab_hit(&cfg, x + w / 2, y + h / 2) == (guide_ctx_t)c,
+                      "%s tab %d is not where it is drawn", code, c);
+                prev_right = x + w - 1;
+            }
+        }
+        cfg.camera = 1;
+        CHECK(lang_display_cols(tr(TR_GUIDE_PRESS)) <= 16 &&
+                  lang_display_cols(tr(TR_GUIDE_TABS_HINT)) <= 16,
+              "%s the drawn screen's lines are wider than it", code);
+        CHECK((int)lang_display_cols(tr(TR_GUIDE_DONE)) * 6 <= GUIDE_DONE_W - 4,
+              "%s DONE is wider than its tile", code);
+        CHECK(lang_display_cols(tr(TR_GUIDE_FOOT)) <= 42 &&
+                  lang_display_cols(tr(TR_LEGEND_GUIDE)) <= 42 &&
+                  lang_display_cols(tr(TR_COMPOSE_HINT_EDIT)) <= 42,
+              "%s a guide line is wider than the screen", code);
+        char both[160];
+        snprintf(both, sizeof(both), "%s   %s", tr(TR_COMPOSE_HINT_FOCUS),
+                 tr(TR_COMPOSE_HINT_TALK));
+        CHECK(lang_display_cols(both) <= 42, "%s composer hint '%s' too wide", code, both);
+    }
+    lang_init();
+
+    // DONE is inside the drawn screen and clear of the tabs.
+    CHECK(guide_done_hit(GUIDE_DONE_X + 1, GUIDE_DONE_Y + 1) &&
+              !guide_done_hit(GUIDE_DONE_X - 1, GUIDE_DONE_Y) &&
+              GUIDE_DONE_Y > GUIDE_TAB_Y + GUIDE_TAB_H,
+          "DONE is not where it is drawn");
+    CHECK(guide_console(CONSOLE_UNKNOWN) == CONSOLE_DSI &&
+              guide_console(CONSOLE_3DS) == CONSOLE_3DS,
+          "an unknown console is not drawn as a DSi");
+
+    // The pop-up never covers the input line, at any size.
+    for (unsigned n = 1; n <= GUIDE_POPUP_LINES; n++) {
+        int x, y, w, h;
+        guide_popup_rect(n, &x, &y, &w, &h);
+        CHECK(y >= 0 && x >= 0 && x + w <= 256 && y + h <= guide_input_px() - 6,
+              "a %u-line pop-up (%d..%d) reaches the input line at %d",
+              n, y, y + h, guide_input_px());
+    }
+
+    // The still session: the input box where guide_input_row() says, and
+    // nothing from anywhere else.
+    static grid_t s1;
+    guide_session_fill(&s1);
+    const int r = guide_input_row();
+    CHECK(s1.cells[r * PROTO_COLS].glyph == 0x8b &&
+              s1.cells[(r + 1) * PROTO_COLS + 2].glyph == '>' &&
+              s1.cells[(r + 2) * PROTO_COLS].glyph == 0x8e,
+          "the input box is not at row %d", r);
+}
+
+static void test_voice_ptt_latch(void)
+{
+    voice_ptt_t p;
+    voice_ptt_init(&p);
+
+    // 1. HOLD mode (the default): 6 frames of R starts, L+R cancels and sets
+    // chord_notice.
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        CHECK(voice_ptt_step(&p, 0, 1, 0, i == 1, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+              "started before frame 6 at frame %u", i);
+    }
+    CHECK(voice_ptt_step(&p, 0, 1, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_START &&
+              p.active && !p.latched,
+          "6th frame of R did not start recording");
+    // With LATCH off, pressing L while R is held cancels and shows focus notice.
+    CHECK(voice_ptt_step(&p, 0, 1, 1, 0, 1, 0, 1, 0, 0) == VOICE_PTT_CANCEL &&
+              p.chord_notice && !p.latched && !p.active,
+          "L+R with LATCH off did not cancel with chord_notice");
+    // Holding R after that cancel cannot start a new recording until released.
+    for (unsigned i = 0; i < 10; i++) {
+        CHECK(voice_ptt_step(&p, 0, 1, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+              "restarted while R still held after L+R cancel");
+    }
+    CHECK(voice_ptt_step(&p, 0, 0, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE &&
+              !p.wait_release,
+          "release after cancel did not clear wait_release");
+
+    // 2. Normal HOLD release: start, hold, let go -> STOP.
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        (void)voice_ptt_step(&p, 0, 1, 0, i == 1, 0, 0, 0, 0, 0);
+    }
+    CHECK(voice_ptt_step(&p, 0, 1, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_START,
+          "second start failed");
+    CHECK(voice_ptt_step(&p, 0, 0, 0, 0, 0, 0, 1, 0, 0) == VOICE_PTT_STOP,
+          "releasing R in HOLD mode did not stop");
+
+    // 3. LATCH mode: start, press L while holding R -> LATCH, release both ->
+    // keeps recording, tap R (or L) on press edge -> STOP, and holding/releasing
+    // that stop tap does not start a new recording.
+    voice_ptt_init(&p);
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        (void)voice_ptt_step(&p, 1, 1, 0, i == 1, 0, 0, 0, 0, 0);
+    }
+    CHECK(voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_START,
+          "LATCH mode start failed");
+    CHECK(voice_ptt_step(&p, 1, 1, 1, 0, 1, 0, 1, 0, 0) == VOICE_PTT_LATCH &&
+              p.latched && !p.chord_notice,
+          "pressing L while holding R in LATCH mode did not latch");
+    // Releasing L, then releasing R, then sitting hands-free keeps recording.
+    CHECK(voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 1, 0, 0) == VOICE_PTT_NONE &&
+              voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 0) == VOICE_PTT_NONE &&
+              voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 0) == VOICE_PTT_NONE &&
+              p.latched,
+          "releasing R and L while latched stopped the recording");
+    // Tap R: stops on the press edge.
+    CHECK(voice_ptt_step(&p, 1, 1, 0, 1, 0, 0, 1, 0, 0) == VOICE_PTT_STOP &&
+              !p.latched && p.wait_release,
+          "tapping R while latched did not stop on press edge");
+    // Holding that stop tap for >= 6 frames and then releasing it must not
+    // start a new recording.
+    for (unsigned i = 0; i < 10; i++) {
+        CHECK(voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE,
+              "holding the stop tap started a new recording at frame %u", i);
+    }
+    CHECK(voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 0, 0, 0) == VOICE_PTT_NONE &&
+              !p.wait_release,
+          "releasing the stop tap acted as a trigger");
+
+    // 4. Tap L to stop a latched recording, X to cancel, and 60 KB auto-stop.
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        (void)voice_ptt_step(&p, 1, 1, 0, i == 1, 0, 0, 0, 0, 0);
+    }
+    (void)voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 0, 0, 0);
+    (void)voice_ptt_step(&p, 1, 1, 1, 0, 1, 0, 1, 0, 0);
+    (void)voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 0);
+    CHECK(voice_ptt_step(&p, 1, 0, 1, 0, 1, 0, 1, 0, 0) == VOICE_PTT_STOP &&
+              !p.latched,
+          "tapping L while latched did not stop");
+    (void)voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    // X cancels a latched recording.
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        (void)voice_ptt_step(&p, 1, 1, 0, i == 1, 0, 0, 0, 0, 0);
+    }
+    (void)voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 0, 0, 0);
+    (void)voice_ptt_step(&p, 1, 1, 1, 0, 1, 0, 1, 0, 0);
+    (void)voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 0);
+    CHECK(voice_ptt_step(&p, 1, 0, 0, 0, 0, 1, 1, 0, 0) == VOICE_PTT_CANCEL &&
+              !p.latched,
+          "X did not cancel a latched recording");
+
+    // 60 KB cap (full=1) stops a latched recording automatically.
+    for (unsigned i = 1; i < VOICE_HOLD_FRAMES; i++) {
+        (void)voice_ptt_step(&p, 1, 1, 0, i == 1, 0, 0, 0, 0, 0);
+    }
+    (void)voice_ptt_step(&p, 1, 1, 0, 0, 0, 0, 0, 0, 0);
+    (void)voice_ptt_step(&p, 1, 1, 1, 0, 1, 0, 1, 0, 0);
+    (void)voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 0);
+    CHECK(voice_ptt_step(&p, 1, 0, 0, 0, 0, 0, 1, 0, 1) == VOICE_PTT_AUTO_STOP &&
+              !p.latched && !p.active,
+          "60 KB cap did not auto-stop a latched recording");
+
+    // 5. Settings row and file persistence: mic_mode=hold|latch, missing or
+    // unknown values default to hold and never reset other settings, and a
+    // 1.0.1 settings file loads intact.
+    settings_t st, back;
+    settings_ui_t ui;
+    char err[64] = "";
+    settings_defaults(&st);
+    settings_ui_init(&ui);
+    CHECK(st.mic_mode == SETTINGS_MIC_HOLD &&
+              settings_option_current(&st, SETTINGS_ROW_MIC) == SETTINGS_MIC_HOLD,
+          "default mic_mode is not HOLD");
+    CHECK(settings_press(&st, &ui, SETTINGS_ROW_MIC, SETTINGS_MIC_LATCH, NULL) ==
+              SETTINGS_PRESS_CHANGED &&
+              st.mic_mode == SETTINGS_MIC_LATCH &&
+              settings_option_current(&st, SETTINGS_ROW_MIC) == SETTINGS_MIC_LATCH,
+          "SETTINGS_ROW_MIC did not switch to LATCH");
+    static const char mpath[] = "/tmp/dsterm-mic-settings.cfg";
+    CHECK(settings_save(mpath, &st, err, sizeof(err)) &&
+              settings_load(mpath, &back, err, sizeof(err)) &&
+              back.mic_mode == SETTINGS_MIC_LATCH,
+          "mic_mode=latch did not survive save/load: %s", err);
+    remove(mpath);
+
+    // A file written by 1.0.1 (no mic_mode, no lang) loads with mic_mode=hold
+    // and keeps every setting 1.0.1 wrote.
+    static const char v101_file[] =
+        "# DS Claude Terminal settings\n"
+        "version=4\n"
+        "model=sonnet\n"
+        "boot=keys\n"
+        "sound=snes\n"
+        "volume=high\n"
+        "blips=low\n"
+        "typing=off\n"
+        "theme=sea\n"
+        "autoconnect=off\n"
+        "addresses=hide\n"
+        "viewtaps=on\n"
+        "god_mode=on\n"
+        "button_a=enter\n"
+        "button_b=space\n"
+        "button_x=esc\n"
+        "button_y=tab\n"
+        "button_start=stop\n"
+        "shutter=l\n"
+        "picture=small\n"
+        "liveview=colour\n";
+    CHECK(settings_parse(v101_file, &back, err, sizeof(err)) &&
+              back.model == SETTINGS_MODEL_SONNET &&
+              back.boot == SETTINGS_BOOT_KEYS &&
+              back.sound == SETTINGS_SOUND_SNES &&
+              back.volume == SETTINGS_VOLUME_HIGH &&
+              back.blips == SETTINGS_WRITING_LOW &&
+              back.typing == 0 &&
+              back.theme == SETTINGS_THEME_SEA &&
+              back.autoconnect == 0 &&
+              back.hide_addresses == 1 &&
+              back.view_taps == 1 &&
+              back.god_mode == 1 &&
+              back.buttons.action[BUTTON_B] == BUTTON_SPACE &&
+              back.camera_shutter == SHUTTER_L &&
+              back.picture == SETTINGS_PICTURE_SMALL &&
+              back.liveview == SETTINGS_LIVEVIEW_COLOUR &&
+              back.mic_mode == SETTINGS_MIC_HOLD &&
+              back.language == LANG_EN,
+          "a 1.0.1 settings file did not load intact: %s", err);
+
+    // Unknown or empty mic_mode falls back to hold and never resets other settings.
+    static const char bad_mic[] =
+        "version=4\ngod_mode=on\ntyping=off\nmic_mode=telepathy\n"
+        "future_key=hello\n";
+    CHECK(settings_parse(bad_mic, &back, err, sizeof(err)) &&
+              back.mic_mode == SETTINGS_MIC_HOLD &&
+              back.god_mode == 1 &&
+              back.typing == 0,
+          "unknown mic_mode or unknown key reset other settings: %s", err);
+}
+
+static void test_project_glyph_rows_never_type(void)
+{
+    // A DO row may carry 0x80..0xBF now (display glyphs, `project64`), and on
+    // a PTY 0x9B is a one-byte CSI.  The row decodes and draws; it must never
+    // become keys, in the composer or in GOD MODE.
+    static project_t project;
+    project_action_t actions[PROJECT_ACTIONS_MAX];
+    unsigned count = 0, index = 0, tab = 0, fg = 0;
+    char label[PROJECT_LABEL_MAX + 1];
+    char value[PROJECT_VALUE_MAX + 1];
+    const uint8_t row[] = { 1, 0, PROJECT_TAB_DO, 9, 4, 5,
+                            'w', 'i', 'p', 'e', 'e', 'c', 0x9B, '2', 'J' };
+    CHECK(proto_apply_project(&count, &index, &tab, &fg, label, sizeof(label),
+                              value, sizeof(value), row,
+                              (uint16_t)sizeof(row)) == PROTO_OK,
+          "a row with a glyph byte was refused outright");
+    CHECK((uint8_t)value[2] == 0x9B, "the glyph byte did not survive for display");
+
+    project_init(&project);
+    CHECK(project_wire_row(&project, count, index, (project_tab_t)tab, fg,
+                           label, value) == 1, "the snapshot did not commit");
+    const unsigned n = project_actions(&project, actions, PROJECT_ACTIONS_MAX);
+    CHECK(n > 0 && actions[0].from_server && (uint8_t)actions[0].body[2] == 0x9B,
+          "the server's action did not come through as sent");
+
+    // The gate every row-to-keys path takes (main.c, project_action_press).
+    CHECK(!project_action_keyable(actions[0].body),
+          "an action carrying 0x9B is typeable");
+    // And the composer refuses it whole as a second line, rather than
+    // loading it with the byte dropped.
+    composer_t c;
+    composer_init(&c);
+    CHECK(!composer_load(&c, actions[0].body) && c.mode == COMPOSER_CLOSED,
+          "the composer loaded an action carrying 0x9B");
+    for (unsigned i = 0; i < n; i++) {
+        if (!project_action_keyable(actions[i].body)) continue;
+        CHECK(strchr(actions[i].body, (char)0x9B) == NULL,
+              "action %u is typeable and carries 0x9B", i);
+    }
+    // The client's own actions, and plain ASCII ones, still type.
+    CHECK(project_action_keyable("npm run test") && !project_action_keyable("") &&
+              !project_action_keyable("a\tb") && !project_action_keyable("x\x7f"),
+          "the keyable gate is not exactly printable ASCII");
+    CHECK(strstr(PROTO_HELLO_CAPS, " project64 ") != NULL,
+          "the card does not announce project64");
+    CHECK(PROTO_PROJECT_ROWS_MAX == 64, "the card no longer takes 64 rows");
 }
 
 int main(void)
@@ -4415,6 +6160,28 @@ int main(void)
     test_log_blank();
 
     printf("== status ==\n");
+    test_lang_and_custom_packs();
+    test_latin_glyphs_are_letters_with_marks();
+    test_settings_unknown_language_keeps_the_rest();
+    test_chime_headline_every_language();
+    test_layout_widths_every_language();
+    test_custom_pack_labels_never_push_off_screen();
+    test_lang_coverage_and_budgets();
+    test_voice_adpcm_and_wire();
+    test_voice_late_replies_are_tagged();
+    test_an_empty_enter_is_not_a_send();
+    test_voice_language_is_not_the_ui_language();
+    test_a_malformed_voice_reply_still_pays();
+    test_settings_values_fall_back_alone();
+    test_custom_pack_cut_on_a_character();
+    test_voice_bar_edges_and_guide_context();
+    test_quick_files_reject_what_they_cannot_read();
+    test_voice_ptt_focus_order();
+    test_voice_ptt_latch();
+    test_guide_every_combo_in_every_context();
+    test_guide_mapping_and_order();
+    test_guide_text_and_geometry_fit();
+    test_project_glyph_rows_never_type();
     test_settings_page();
     test_privacy_mask();
     test_quick();

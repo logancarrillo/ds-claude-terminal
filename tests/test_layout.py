@@ -56,13 +56,13 @@ def test_client_state_stays_in_parts():
     c = ClientState(None, ("t", 1), None, b"")
     parts = [f.name for f in dataclasses.fields(ClientState)
              if dataclasses.is_dataclass(getattr(c, f.name))]
-    assert parts == ["caps", "feeds", "sessions", "ext", "scroll", "agents", "camera"]
+    assert parts == ["caps", "feeds", "sessions", "ext", "scroll", "agents", "camera", "voice"]
 
 
 def test_state_is_slotted():
     # A misspelt field is an AttributeError, never a silent new attribute.
     c = ClientState(None, ("t", 1), None, b"")
-    for holder in (c, c.caps, c.feeds, c.sessions, c.ext, c.scroll, c.agents, c.camera):
+    for holder in (c, c.caps, c.feeds, c.sessions, c.ext, c.scroll, c.agents, c.camera, c.voice):
         try:
             holder.no_such_field = 1
         except AttributeError:
@@ -131,7 +131,8 @@ FEATURE_CALLS = {
 # touch any of them -- it is the connection -- and `caps` is the HELLO's,
 # read by everyone; any other part is touched only by its own feature.
 PART_OWNERS = {"feeds": "server_feeds", "sessions": "server_sessions", "ext": "server_ext",
-               "scroll": "server_scrollback", "agents": "server_agents", "camera": "server_camera"}
+               "scroll": "server_scrollback", "agents": "server_agents", "camera": "server_camera",
+               "voice": "server_voice"}
 
 
 def _ownership():

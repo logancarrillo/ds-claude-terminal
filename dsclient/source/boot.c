@@ -79,6 +79,11 @@ const char *boot_console_name(void)
     return console_name(&console);
 }
 
+console_family_t boot_console_family(void)
+{
+    return console.family;
+}
+
 static framereader_t boot_reader;
 
 // ---------------------------------------------------------------- input ---

@@ -66,6 +66,12 @@ TO_WIRE = {
     0x276E: 0xB7,  # ❮  substituted with U+003C
     0x203A: 0xB8,  # ›  substituted with U+003E
     0x2039: 0xB9,  # ‹  substituted with U+003C
+    0x2581: 0xBA,  # ▁  drawn
+    0x2582: 0xBB,  # ▂  drawn
+    0x2583: 0xBC,  # ▃  drawn
+    0x2585: 0xBD,  # ▅  drawn
+    0x2586: 0xBE,  # ▆  drawn
+    0x2587: 0xBF,  # ▇  drawn
 }
 
 # wire byte -> codepoint

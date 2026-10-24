@@ -9,6 +9,9 @@
 //   COMMANDS  slash commands, built in and the computer's own (the project's
 //             and your .claude/commands and skills), into the composer.
 //   AGAIN     the prompts you sent lately, into the composer to send again.
+//   VOICE     the composer, with the microphone ready.
+//   CONTROLS  the controls guide (guide.h): every button and combo, tried
+//             on a drawing of this console without sending anything.
 //   PHOTO     the camera screen -- a DSi-only row.  It is the last row, and
 //             a card without a camera does not have it (quick_row_count).
 //
@@ -25,12 +28,16 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "lang.h"
+
 typedef enum {
     QUICK_ROW_MODE = 0,
     QUICK_ROW_UNDO,
     QUICK_ROW_CHANGES,
     QUICK_ROW_COMMANDS,
     QUICK_ROW_AGAIN,
+    QUICK_ROW_VOICE,
+    QUICK_ROW_CONTROLS,
     QUICK_ROW_PHOTO,
     QUICK_ROW_COUNT,
 } quick_row_t;
@@ -39,8 +46,12 @@ const char *quick_row_label(quick_row_t row);
 // What the row does, in a few words, for the right of its line.
 const char *quick_row_note(quick_row_t row);
 // PHOTO's note is a fact of the connection, not the card: main sets it when
-// CAMERA_READY lands (NULL restores "see it, send it").  Borrowed pointer.
-void quick_set_photo_note(const char *note);
+// CAMERA_READY lands (TR_COUNT restores "see it, send it").  A string id, so
+// it is drawn in whatever language is on screen when the menu is.
+void quick_set_photo_note(tr_id_t note);
+// VOICE's note follows MIC_READY on the connection (TR_COUNT restores
+// "speak into the composer").
+void quick_set_voice_note(tr_id_t note);
 
 // How many rows the menu has on this card: PHOTO is last, so it is simply
 // one fewer on a card without a camera.
@@ -78,6 +89,59 @@ unsigned quick_commands_apply(quick_commands_t *c, const uint8_t *payload,
                               size_t len);
 // How many of the list are built in (they come first).
 unsigned quick_commands_builtin(void);
+
+// ------------------------------------------------------- SAVED COMMANDS ---
+//
+// Custom quick commands saved on the card (/dsterm/quick.txt).  Shown in
+// COMMANDS after the built-ins and above the computer's own, with a "+ ADD"
+// row at the end of the list.  May hold any printable prompt text up to the
+// composer's limit (not only slash commands), and choosing one loads it into
+// the composer so it still takes A to send.
+#define QUICK_SAVED_MAX 16
+#define QUICK_SAVED_TEXT_MAX 1024
+
+typedef struct {
+    unsigned count;
+    char items[QUICK_SAVED_MAX][QUICK_SAVED_TEXT_MAX + 1];
+} quick_saved_t;
+
+void quick_saved_init(quick_saved_t *s);
+int  quick_saved_add(quick_saved_t *s, const char *text);
+// The same, saying why not, and where the command is (`*index`, set on OK,
+// including when it was already in the list).  A tab becomes a space -- the
+// composer takes tabs from a snippet or the clipboard, and a saved command
+// is shown on one line -- and nothing else outside printable ASCII is kept.
+typedef enum {
+    QUICK_ADD_OK = 0,
+    QUICK_ADD_EMPTY,        // nothing but spaces
+    QUICK_ADD_TOO_LONG,     // over QUICK_SAVED_TEXT_MAX
+    QUICK_ADD_INVALID,      // a byte that is not printable ASCII, tab or newline
+    QUICK_ADD_FULL,         // QUICK_SAVED_MAX already
+} quick_add_result_t;
+quick_add_result_t quick_saved_add_at(quick_saved_t *s, const char *text,
+                                      unsigned *index);
+int  quick_saved_remove(quick_saved_t *s, unsigned index);
+size_t quick_saved_format(const quick_saved_t *s, char *out, size_t cap);
+void quick_saved_parse(quick_saved_t *s, const char *text);
+
+typedef enum {
+    QUICK_CMD_NONE = 0,
+    QUICK_CMD_BUILTIN,
+    QUICK_CMD_SAVED,
+    QUICK_CMD_SERVER,
+    QUICK_CMD_ADD,
+} quick_cmd_kind_t;
+
+// Total rows in the COMMANDS menu: built-ins + saved + server's + "+ ADD".
+unsigned quick_commands_total(const quick_commands_t *c,
+                              const quick_saved_t *s);
+// Classify row `index` in the COMMANDS menu and return its text (or "+ ADD").
+// When the row is QUICK_CMD_SAVED, `*saved_idx` receives its index in `s`.
+quick_cmd_kind_t quick_commands_entry(const quick_commands_t *c,
+                                      const quick_saved_t *s,
+                                      unsigned index,
+                                      const char **text_out,
+                                      unsigned *saved_idx);
 
 // ---------------------------------------------------------------- AGAIN ---
 

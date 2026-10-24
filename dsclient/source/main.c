@@ -8,6 +8,7 @@
 // problems are legible without disturbing the terminal.
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <stdarg.h>
@@ -32,10 +33,13 @@
 #include "config.h"
 #include "ext.h"
 #include "focus.h"
+#include "guide.h"
 #include "host.h"
 #include "kbd.h"
 #include "keys.h"
+#include "lang.h"
 #include "log.h"
+#include "mic.h"
 #include "mirror.h"
 #include "photo.h"
 #include "privacy.h"
@@ -53,6 +57,7 @@
 #include "sound.h"
 #include "status.h"
 #include "subscreen.h"
+#include "voice.h"
 #include "wav.h"
 
 // Snippets are optional.  The drive prefix is not knowable in advance: libfat
@@ -151,14 +156,37 @@ static inline int page_mode(screen_mode_t mode)
 // the camera section; the forward declaration is all composer_close needs.
 static void photo_discard_pending(void);
 
+static voice_ptt_t mic_ptt;
+static int mic_touch_held = 0;
+static int composer_adding_quick = 0;
+
 // Shut the whole overlay, both panes.  One function so that closing can never
 // leave the pane state behind for the next open to inherit -- which is how a
 // COMPOSE button comes to open a list of snippets.
 static void composer_close(void)
 {
+    // Focus taken inside the composer ends with it: left on, the next A on
+    // the Control screen would type the lit key into the session itself.
+    if (focus_active()) focus_off();
+    mic_cancel();
+    voice_ptt_init(&mic_ptt);
+    mic_touch_held = 0;
+    composer_adding_quick = 0;
     photo_discard_pending();
     composer_cancel(&composer);
     composer_pane = COMPOSER_PANE_WRITE;
+    snippet_focus = 0;
+}
+
+// Open the composer onto an empty buffer, the way every opener does: the
+// write pane first, the snippet highlight home.  One function so an opener
+// cannot inherit a pane the last session left behind.
+static void composer_open_write(void)
+{
+    composer_open(&composer);
+    composer_adding_quick = 0;
+    composer_pane = COMPOSER_PANE_WRITE;
+    snippet_pick = 0;
     snippet_focus = 0;
 }
 
@@ -191,6 +219,8 @@ static int composer_photo_id = 0; // the saved picture's id while it is composed
 
 static unsigned quick_held, quick_frames;
 static quick_commands_t commands;
+static quick_saved_t saved_commands;
+static int quick_remove_armed = 0;
 static quick_recent_t recent;
 static quick_line_t typed_line;
 // Claude's mode, as last read off its footer ("" until seen).
@@ -203,6 +233,8 @@ static int rewind_enters;
 static unsigned rewind_frames;
 #define REWIND_PICK_FRAMES (90 * 60)
 #define RECENT_PATH PROFILES_ROOT "/recent.txt"
+#define QUICK_PATH  PROFILES_ROOT "/quick.txt"
+#define QUICK_TMP   PROFILES_ROOT "/quick.new"
 
 // REMOTE: the server's list of Claude sessions, the computers this card can
 // move to, and the picker over both (remote.h).  `remote_menu` is the picker
@@ -305,10 +337,21 @@ static int sub_dirty = 1;
 // at all while nothing changes.
 static int overlay_dirty = 0;
 static void overlay_repaint(void);
+// The controls guide (guide.h): open or not, and the calls the menus that
+// open it need before its section below.
+static int guide_open = 0;
+// The screen SELECT cycled away from on the press still held, or -1: when
+// that SELECT turns out to be the first half of SELECT + START, the guide
+// opens over the screen it was pressed on rather than the next one.
+static int select_cycled_from = -1;
+static void guide_show(guide_ctx_t ctx);
+static void guide_paint_top(void);
 static void overlay_sync(void);
 static void page_repaint(void);
 static void project_resync(void);
 static void recent_remember(const char *text);
+static void quick_saved_commit_from_composer(void);
+static void focus_step(unsigned dp, unsigned long *tx);
 static void typed_bytes(const char *bytes, size_t n);
 static void rewind_done(void);
 
@@ -903,8 +946,10 @@ static void connection_forget(int tidy_pages)
     // without a goodbye byte (a dead socket is told nothing), and the saved
     // picture's id -- per connection on the server -- is forgotten.
     photo_forget();
+    mic_forget();
     composer_photo_id = 0;
-    quick_set_photo_note("not on this computer");
+    quick_set_photo_note(TR_QUICK_NOTE_NOT_HERE);
+    quick_set_voice_note(TR_QUICK_NOTE_NOT_HERE);
     // The computer's commands belong to this connection's computer.
     quick_commands_init(&commands);
     rewind_done();
@@ -991,6 +1036,22 @@ int host_send_camera(const uint8_t *frame, size_t n, unsigned long *tx)
     if (n < PROTO_HEADER_SIZE) return 0;
     if (!proto_camera_type(frame[3])) {
         status("camera: refused a frame that is not the camera's");
+        return 0;
+    }
+    if (send_all(frame, n)) {
+        if (tx) (*tx)++;
+        return 1;
+    }
+    status("send failed; connection lost");
+    reconnect();
+    return 0;
+}
+
+int host_send_voice(const uint8_t *frame, size_t n, unsigned long *tx)
+{
+    if (n < PROTO_HEADER_SIZE) return 0;
+    if (!proto_voice_type(frame[3])) {
+        status("voice: refused a frame that is not the microphone's");
         return 0;
     }
     if (send_all(frame, n)) {
@@ -1118,7 +1179,9 @@ static int send_key_seq(const char *seq, size_t seq_len, unsigned long *tx)
         // that cues. This single site is why the send sound works for live
         // typing and the composer alike: the sound follows the wire, not the
         // UI path that produced the bytes.
-        if (seq_len == 1 && seq[0] == '\r') {
+        // ...but only when it submits something: chime_typed() says whether
+        // anything was typed on the line first (chime.h).
+        if (chime_typed(seq, seq_len)) {
             ext_event(EXT_EVENT_LOCAL_SEND);
             chime_sent();
         }
@@ -1249,6 +1312,11 @@ static void send_ping(unsigned long *tx)
 // resync -- the cells were never overwritten in the model, only on the LCD.
 static void overlay_repaint(void)
 {
+    // The guide stands over everything it can be opened above.
+    if (guide_open) {
+        guide_paint_top();
+        return;
+    }
     if (remote_menu) {
         remote_row_t rows[REMOTE_ROWS_MAX];
         const unsigned n = remote_rows(&remote, &computers, rows, REMOTE_ROWS_MAX);
@@ -1286,8 +1354,8 @@ static void overlay_repaint(void)
 
     if (composer.mode != COMPOSER_CLOSED &&
         composer_pane == COMPOSER_PANE_SNIPPETS) {
-        char labels[SNIPPETS_MAX][SNIPPET_LABEL_MAX + 3];
-        const char *rows[SNIPPETS_MAX];
+        static char labels[SNIPPETS_MAX][SNIPPET_LABEL_MAX + 3];
+        static const char *rows[SNIPPETS_MAX];
         for (int i = 0; i < snippets.count && i < SNIPPETS_MAX; i++) {
             snprintf(labels[i], sizeof(labels[i]), "%c %s",
                      i == snippet_pick ? '>' : ' ', snippets.items[i].label);
@@ -1313,11 +1381,28 @@ static void overlay_repaint(void)
     }
 
     // AGAIN: the highlighted prompt in full, since a row shows only its start.
-    if (quick_menu && quick_level == SUBSCREEN_QUICK_AGAIN &&
+    if (composer.mode == COMPOSER_CLOSED && quick_menu &&
+        quick_level == SUBSCREEN_QUICK_AGAIN &&
         (unsigned)quick_sel < recent.count) {
         render_overlay_text("AGAIN -- A LOADS IT INTO THE COMPOSER",
                             recent.items[quick_sel], "A COMPOSE   Y FORGET   X BACK");
         return;
+    }
+
+    // COMMANDS: a saved command in full, since it may be a multi-line prompt.
+    if (composer.mode == COMPOSER_CLOSED && quick_menu &&
+        quick_level == SUBSCREEN_QUICK_COMMANDS && quick_sel >= 0) {
+        const char *entry = "";
+        if (quick_commands_entry(&commands, &saved_commands,
+                                 (unsigned)quick_sel, &entry, NULL) ==
+            QUICK_CMD_SAVED) {
+            render_overlay_text(
+                "QUICK COMMAND -- A LOADS IT INTO THE COMPOSER",
+                entry,
+                quick_remove_armed ? "A COMPOSE   Y SURE?   X BACK"
+                                   : "A COMPOSE   Y FORGET   X BACK");
+            return;
+        }
     }
 
     // The two full pages own the top screen while they are selected.  Both are
@@ -1334,10 +1419,18 @@ static void overlay_repaint(void)
         return;
     }
 
-    render_overlay_text("COMPOSE -- LOCAL, NOTHING SENT YET",
+    render_overlay_text(composer_adding_quick
+                            ? "ADD QUICK COMMAND -- SAVED ON CARD, NOT SENT"
+                            : "COMPOSE -- LOCAL, NOTHING SENT YET",
                         composer.body,
                         composer_focus_notice ?
-                            "FOCUS UNAVAILABLE: TEXT EDITOR" :
+                            "FOCUS: HOLD L FIRST, THEN PRESS R" :
+                        focus_active() ?
+                            (composer_adding_quick
+                                 ? "FOCUS  A TYPE  B DEL  START SAVE  X OUT"
+                                 : "FOCUS  A TYPE  B DEL  START SEND  X OUT") :
+                        composer_adding_quick ?
+                            "A SAVE COMMAND  B DEL  Y SNIPPETS  X CANCEL" :
                             "A SEND  B DEL  Y SNIPPETS  X CANCEL");
 }
 
@@ -1348,8 +1441,10 @@ static void overlay_repaint(void)
 static void overlay_sync(void)
 {
     subscreen_set_composer(composer.mode != COMPOSER_CLOSED);
+    subscreen_set_composer_add_quick(composer_adding_quick);
     subscreen_set_quick(quick_menu, quick_level, quick_sel, quick_top, &commands,
                         &recent);
+    subscreen_set_quick_saved(&saved_commands, quick_remove_armed);
     subscreen_set_remote(remote_menu, &remote, &computers, &remote_ui,
                          boot_server_name());
     ext_overlay_sync();
@@ -1573,6 +1668,44 @@ static void composer_clip_input(unsigned edge)
     }
 }
 
+// Focus inside the composer: the d-pad walks the composer's keyboard and A
+// types the lit key -- into the buffer, through composer_key(), the same path
+// a tap takes, so nothing here can reach the PTY. A is taken, so START sends
+// (or saves, adding a quick command); B deletes; X leaves focus, not the
+// composer, so a half-written prompt is never lost to it. Returns 1 when it
+// used the frame.
+static unsigned composer_focus_held, composer_focus_frames;
+
+static int composer_focus_input(unsigned raw, unsigned edge, unsigned long *tx)
+{
+    if (edge & KEY_X) { focus_off(); overlay_sync(); return 1; }
+    if (edge & KEY_A) {
+        composer_key(focus_key_id());
+        overlay_sync();
+        return 1;
+    }
+    if (edge & KEY_B) { composer_backspace(&composer); overlay_sync(); return 1; }
+    if (edge & KEY_START) {
+        if (composer.len == 0) return 1;
+        if (composer_adding_quick) quick_saved_commit_from_composer();
+        else                       composer_send(tx);
+        overlay_sync();
+        return 1;
+    }
+    const unsigned dp = raw & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
+    if (dp != composer_focus_held) {
+        composer_focus_held = dp;
+        composer_focus_frames = 0;
+        if (dp) focus_step(dp, tx);
+    } else if (dp) {
+        composer_focus_frames++;
+        if (kbd_repeat_should_fire(composer_focus_frames)) focus_step(dp, tx);
+    }
+    if (dp) { overlay_sync(); return 1; }
+    // Y (snippets) and everything else fall through to the editor.
+    return 0;
+}
+
 static void composer_input(unsigned raw, unsigned edge, unsigned long *tx)
 {
     if (composer_pane == COMPOSER_PANE_SNIPPETS) {
@@ -1584,19 +1717,79 @@ static void composer_input(unsigned raw, unsigned edge, unsigned long *tx)
         return;
     }
 
-    if (shoulder_chord(raw, edge)) {
-        // The buffer is deliberately not a focus surface: it is a text
-        // editor with a safety guarantee that every key stays local until
-        // explicit Send.  Saying why is much better than a chord that dies.
-        // The snippets pane beside it *is* one, and handles the chord itself.
+    const voice_ptt_action_t ptt = voice_ptt_step(
+        &mic_ptt, ui_settings.mic_mode == SETTINGS_MIC_LATCH,
+        (raw & KEY_R) != 0, (raw & KEY_L) != 0,
+        (edge & KEY_R) != 0, (edge & KEY_L) != 0, (edge & KEY_X) != 0,
+        mic_recording(), mic_waiting(), mic_full());
+    if (ptt == VOICE_PTT_FOCUS) {
+        // L first, then R: focus on the composer's own keyboard. It stays a
+        // text editor with the same guarantee -- every key it types lands in
+        // the buffer (composer_focus_input), nothing reaches the PTY until an
+        // explicit send -- and the chord again leaves it.
+        if (focus_active()) {
+            focus_off();
+        } else {
+            focus_on(FOCUS_KEYS);
+            composer_focus_held = 0;
+            composer_focus_frames = 0;
+        }
+        composer_focus_notice = 0;
+        overlay_sync();
+        return;
+    }
+    if (mic_ptt.chord_notice) {
+        // R first, then L, with nothing recording: not the focus chord. Say
+        // which order is, rather than a chord that dies.
+        if (ptt == VOICE_PTT_CANCEL) mic_cancel();
         composer_focus_notice = 1;
         overlay_sync();
         return;
     }
+    switch (ptt) {
+    case VOICE_PTT_START:
+        // Capability first: a server that never proved speech-to-text
+        // gets no VOICE_START, and the hold gets at most one line per
+        // connection rather than one per press.
+        if (mic_can_transcribe()) {
+            (void)mic_start(lang_voice_code(ui_settings.language), tx);
+        } else {
+            mic_explain_unavailable();
+        }
+        break;
+    case VOICE_PTT_LATCH:
+        mic_set_latched(1);
+        status("voice: recording -- tap R or L to stop");
+        overlay_sync();
+        return;
+    case VOICE_PTT_STOP:
+        // A shoulder let go: a recording the MIC bar is still holding is the
+        // touch's to stop, not the shoulder's.
+        if (!mic_touch_held) mic_stop(tx);
+        overlay_sync();
+        return;
+    case VOICE_PTT_AUTO_STOP:
+        // The 60 KB cap holds whoever started the recording, the bar
+        // included.  mic_tick() normally stopped it already (mic.h, mic_full).
+        mic_stop(tx);
+        mic_touch_held = 0;
+        overlay_sync();
+        return;
+    case VOICE_PTT_CANCEL:
+        mic_cancel();
+        mic_touch_held = 0;
+        overlay_sync();
+        return;
+    case VOICE_PTT_NONE:
+    default:
+        break;
+    }
+
     // Leave the explanation up until an actual editor action supersedes it;
     // clearing it on the next held-shoulder frame would make a one-frame
     // message the user can never read.
     if (edge & ~(KEY_L | KEY_R)) composer_focus_notice = 0;
+    if (focus_active() && composer_focus_input(raw, edge, tx)) return;
     if (edge & KEY_X) {
         composer_close();
         overlay_sync();
@@ -1608,6 +1801,16 @@ static void composer_input(unsigned raw, unsigned edge, unsigned long *tx)
     // prompt still in hand, and picking one replaces it only because that is
     // what loading a snippet has always done.
     if (edge & KEY_Y) {
+        // The snippets pane never steps the push-to-talk helper, so a
+        // recording left running behind it -- latched, or R still held --
+        // could be stopped only by X, which closes the composer and the
+        // draft with it. Finish it here: what was said is transcribed into
+        // the composer as if R had been let go.
+        if (mic_recording()) mic_stop(tx);
+        voice_ptt_init(&mic_ptt);
+        // The snippets pane has its own focus (L+R there); the keyboard's
+        // would light a key nobody can press from that pane.
+        if (focus_active()) focus_off();
         composer_pane = COMPOSER_PANE_SNIPPETS;
         snippet_pick = 0;
         snippet_focus = 0;
@@ -1623,8 +1826,9 @@ static void composer_input(unsigned raw, unsigned edge, unsigned long *tx)
     // is precisely what accepts a permission prompt. Opening this screen by
     // accident and pressing the commit key must not approve anything.
     if (edge & KEY_A) {
-        if (composer.len == 0) { composer_close(); overlay_sync(); }
-        else                   composer_send(tx);
+        if (composer.len == 0)      { composer_close(); overlay_sync(); }
+        else if (composer_adding_quick) quick_saved_commit_from_composer();
+        else                        composer_send(tx);
     }
     else if (edge & KEY_B) { composer_backspace(&composer); overlay_sync(); }
 }
@@ -1871,6 +2075,82 @@ static void recent_remember(const char *text)
     if (quick_recent_add(&recent, text)) recent_save();
 }
 
+// One buffer for both directions: the formatted list is at most this, and
+// the two never run at once.
+static char quick_file[QUICK_SAVED_MAX * (2 * QUICK_SAVED_TEXT_MAX + 1) + 1];
+
+// The new list goes to a file of its own first, and only once that is whole
+// on the card does it replace the old one. Removing the old file first meant
+// a full, read-only or pulled card lost every saved command at once. If the
+// rename itself fails, the complete list is still in QUICK_TMP, and loading
+// falls back to it.
+static int quick_saved_save(void)
+{
+    const size_t n = quick_saved_format(&saved_commands, quick_file, sizeof(quick_file));
+    FILE *fh = fopen(QUICK_TMP, "wb");
+    if (!fh) return 0;
+    const int wrote = (n == 0 || fwrite(quick_file, 1, n, fh) == n);
+    if (fclose(fh) != 0 || !wrote) {
+        (void)remove(QUICK_TMP);
+        return 0;
+    }
+    (void)remove(QUICK_PATH);
+    return rename(QUICK_TMP, QUICK_PATH) == 0;
+}
+
+static void quick_saved_load(void)
+{
+    quick_saved_init(&saved_commands);
+    FILE *fh = fopen(QUICK_PATH, "rb");
+    if (!fh) fh = fopen(QUICK_TMP, "rb");
+    if (!fh) return;
+    const size_t got = fread(quick_file, 1, sizeof(quick_file) - 1, fh);
+    fclose(fh);
+    quick_file[got] = '\0';
+    quick_saved_parse(&saved_commands, quick_file);
+}
+
+static void quick_saved_commit_from_composer(void)
+{
+    // A save that fails keeps the composer and its text, and says why: the
+    // words are the person's, and closing on a failure threw them away.
+    unsigned at = 0;
+    switch (quick_saved_add_at(&saved_commands, composer.body, &at)) {
+    case QUICK_ADD_OK:
+        break;
+    case QUICK_ADD_EMPTY:
+        status("quick: nothing to save -- type a command first");
+        overlay_sync();
+        return;
+    case QUICK_ADD_TOO_LONG:
+        status("quick: too long to save (%u characters max)", QUICK_SAVED_TEXT_MAX);
+        overlay_sync();
+        return;
+    case QUICK_ADD_INVALID:
+        status("quick: only plain characters can be saved");
+        overlay_sync();
+        return;
+    case QUICK_ADD_FULL:
+    default:
+        status("quick: the list is full (%u max) -- Y on one forgets it",
+               QUICK_SAVED_MAX);
+        overlay_sync();
+        return;
+    }
+    if (quick_saved_save()) status("quick: saved command");
+    else status("quick: could not write the card -- saved until restart");
+    composer_close();
+    quick_menu = 1;
+    quick_level = SUBSCREEN_QUICK_COMMANDS;
+    quick_remove_armed = 0;
+    quick_sel = (int)(quick_commands_builtin() + at);
+    quick_top = 0;
+    if (quick_sel >= SUBSCREEN_QUICK_LIST_ROWS) {
+        quick_top = quick_sel - SUBSCREEN_QUICK_LIST_ROWS + 1;
+    }
+    overlay_sync();
+}
+
 // A byte stream typed live (KEYS, the face buttons, the d-pad): a line ended
 // with Enter is kept for AGAIN.  Short ones -- a "y", a "2" -- are answers,
 // not prompts worth sending again.
@@ -1908,7 +2188,9 @@ static void claude_mode_scan(void)
 
 static unsigned quick_count(void)
 {
-    if (quick_level == SUBSCREEN_QUICK_COMMANDS) return commands.count;
+    if (quick_level == SUBSCREEN_QUICK_COMMANDS) {
+        return quick_commands_total(&commands, &saved_commands);
+    }
     if (quick_level == SUBSCREEN_QUICK_AGAIN) return recent.count;
     return quick_row_count(photo_available());
 }
@@ -1918,6 +2200,7 @@ static void quick_show(int level)
     quick_level = level;
     quick_sel = 0;
     quick_top = 0;
+    quick_remove_armed = 0;
     overlay_sync();
 }
 
@@ -1926,6 +2209,7 @@ static void quick_close(void)
     quick_menu = 0;
     quick_held = 0;
     quick_frames = 0;
+    quick_remove_armed = 0;
     quick_level = SUBSCREEN_QUICK_MAIN;
     overlay_sync();
 }
@@ -1939,6 +2223,7 @@ static void quick_move(int delta)
     if (next >= count) next = count - 1;
     if (next == quick_sel) return;
     quick_sel = next;
+    quick_remove_armed = 0;
     if (quick_sel < quick_top) quick_top = quick_sel;
     if (quick_sel >= quick_top + SUBSCREEN_QUICK_LIST_ROWS) {
         quick_top = quick_sel - SUBSCREEN_QUICK_LIST_ROWS + 1;
@@ -1953,10 +2238,7 @@ static void quick_move(int delta)
 static void quick_compose(const char *text)
 {
     quick_close();
-    composer_open(&composer);
-    composer_pane = COMPOSER_PANE_WRITE;
-    snippet_pick = 0;
-    snippet_focus = 0;
+    composer_open_write();
     if (!composer_load(&composer, text)) status("quick: too long for the composer");
     overlay_sync();
 }
@@ -1964,7 +2246,18 @@ static void quick_compose(const char *text)
 static void quick_activate(unsigned long *tx)
 {
     if (quick_level == SUBSCREEN_QUICK_COMMANDS) {
-        if ((unsigned)quick_sel < commands.count) quick_compose(commands.names[quick_sel]);
+        quick_remove_armed = 0;
+        const char *text = "";
+        const quick_cmd_kind_t kind = quick_commands_entry(
+            &commands, &saved_commands, (unsigned)quick_sel, &text, NULL);
+        if (kind == QUICK_CMD_ADD) {
+            quick_close();
+            composer_open_write();
+            composer_adding_quick = 1;
+            overlay_sync();
+        } else if (kind != QUICK_CMD_NONE) {
+            quick_compose(text);
+        }
         return;
     }
     if (quick_level == SUBSCREEN_QUICK_AGAIN) {
@@ -2006,6 +2299,20 @@ static void quick_activate(unsigned long *tx)
     case QUICK_ROW_AGAIN:
         quick_show(SUBSCREEN_QUICK_AGAIN);
         break;
+    case QUICK_ROW_VOICE:
+        if (!mic_can_transcribe()) {
+            status("voice: not available on this computer");
+            break;
+        }
+        quick_close();
+        composer_open_write();
+        overlay_sync();
+        status("voice: hold R (or tap the MIC bar) to speak");
+        break;
+    case QUICK_ROW_CONTROLS:
+        // QUICK stays open underneath: leaving the guide comes back here.
+        guide_show(GUIDE_CTX_CONTROL);
+        break;
     case QUICK_ROW_PHOTO:
         // A camera on a computer that never sent READY is not a camera at
         // all; the row's note says why.
@@ -2026,6 +2333,11 @@ static void quick_input(unsigned raw, unsigned edge, unsigned long *tx)
 {
     // B or X: out one level, then out of QUICK.
     if (shoulder_chord(raw, edge) || (edge & (KEY_B | KEY_X))) {
+        if (quick_remove_armed && (edge & KEY_B)) {
+            quick_remove_armed = 0;
+            overlay_sync();
+            return;
+        }
         if (quick_level != SUBSCREEN_QUICK_MAIN && !shoulder_chord(raw, edge)) {
             const int back_to = quick_level == SUBSCREEN_QUICK_COMMANDS
                                     ? QUICK_ROW_COMMANDS : QUICK_ROW_AGAIN;
@@ -2039,6 +2351,27 @@ static void quick_input(unsigned raw, unsigned edge, unsigned long *tx)
     }
     if (edge & KEY_A) {
         quick_activate(tx);
+        return;
+    }
+    if ((edge & KEY_Y) && quick_level == SUBSCREEN_QUICK_COMMANDS) {
+        unsigned saved_idx = 0;
+        if (quick_commands_entry(&commands, &saved_commands,
+                                 (unsigned)quick_sel, NULL, &saved_idx) ==
+            QUICK_CMD_SAVED) {
+            if (!quick_remove_armed) {
+                quick_remove_armed = 1;
+                overlay_sync();
+            } else if (quick_saved_remove(&saved_commands, saved_idx)) {
+                if (!quick_saved_save()) {
+                    status("quick: could not write the card -- gone until restart");
+                }
+                quick_remove_armed = 0;
+                const int total = (int)quick_count();
+                if (quick_sel >= total && quick_sel > 0) quick_sel--;
+                if (quick_top > quick_sel) quick_top = quick_sel;
+                overlay_sync();
+            }
+        }
         return;
     }
     if ((edge & KEY_Y) && quick_level == SUBSCREEN_QUICK_AGAIN) {
@@ -2147,10 +2480,7 @@ static void camera_saved(const photo_saved_t *saved)
     if (!photo_saved_ok(saved)) return;
     composer_photo_id = saved->id;
     photo_close(1);
-    composer_open(&composer);
-    composer_pane = COMPOSER_PANE_WRITE;
-    snippet_pick = 0;
-    snippet_focus = 0;
+    composer_open_write();
     char body[COMPOSER_MAX + 1];
     snprintf(body, sizeof(body), "Picture from the DS camera: %s ",
              saved->path);
@@ -2261,6 +2591,42 @@ static void load_custom_sounds(void)
     }
 }
 
+static void load_custom_langs(void)
+{
+    static const char *const ROOTS[] = {
+        "/dsterm/lang",
+        "sd:/dsterm/lang",
+        "fat:/dsterm/lang",
+    };
+    unsigned loaded = 0;
+    for (unsigned r = 0; r < sizeof(ROOTS) / sizeof(ROOTS[0]); r++) {
+        DIR *dir = opendir(ROOTS[r]);
+        if (!dir) continue;
+        struct dirent *ent;
+        while ((ent = readdir(dir)) != NULL && lang_count() < LANG_MAX) {
+            const char *name = ent->d_name;
+            const size_t n = strlen(name);
+            if (n <= 5 || strcmp(name + n - 5, ".lang") != 0) continue;
+            char code[LANG_CODE_MAX + 1];
+            const size_t clen = n - 5 < LANG_CODE_MAX ? n - 5 : LANG_CODE_MAX;
+            memcpy(code, name, clen);
+            code[clen] = '\0';
+            char path[128], err[64] = "";
+            snprintf(path, sizeof(path), "%s/%s", ROOTS[r], name);
+            if (lang_load_file(path, code, err, sizeof(err)) >= 0) {
+                loaded++;
+            } else {
+                status("lang: %s skipped (%s)", name, err[0] ? err : "invalid");
+            }
+        }
+        closedir(dir);
+        if (loaded) break;
+    }
+    if (loaded) {
+        status("lang: %u custom language pack(s) loaded", loaded);
+    }
+}
+
 // The facts the ABOUT block reports.  Composed here because this is where they
 // are known, and only placed by settings.c -- the same split project.c uses,
 // and for the same reason: two places formatting one value is how they drift.
@@ -2329,6 +2695,10 @@ static void sound_settings_apply(void)
 static void settings_apply(void)
 {
     boot_set_autoconnect(ui_settings.autoconnect);
+    if (lang_current() != ui_settings.language) {
+        lang_set_current(ui_settings.language);
+        page_repaint();
+    }
     // Every line the card draws goes through the mask, so the change shows
     // everywhere at once: repaint both screens.
     if (privacy_hiding() != ui_settings.hide_addresses) {
@@ -2340,7 +2710,7 @@ static void settings_apply(void)
         const button_t yes = button_for(&ui_settings.buttons, BUTTON_ENTER);
         const button_t no = button_for(&ui_settings.buttons, BUTTON_ESC);
         chime_set_answer_buttons(button_name(yes), button_name(no));
-        char legend[48];
+        char legend[128];
         button_map_legend(&ui_settings.buttons, legend, sizeof(legend));
         const button_t stop = button_for(&ui_settings.buttons, BUTTON_STOP);
         const button_t tab = button_for(&ui_settings.buttons, BUTTON_TAB);
@@ -2431,6 +2801,10 @@ static void settings_chip_press(settings_row_t row, unsigned option,
         sound_settings_apply();
         status("settings: back to defaults");
         break;
+    case SETTINGS_PRESS_GUIDE:
+        // Settings stays underneath, on this row, for when the guide closes.
+        guide_show(GUIDE_CTX_CONTROL);
+        break;
     case SETTINGS_PRESS_NOTHING:
     default:
         break;
@@ -2461,15 +2835,27 @@ static void project_action_press(unsigned index, unsigned long *tx)
 
     const char *body = actions[index].body;
     if (!body[0]) return;
+    // The decoder keeps 0x80..0xBF in a row so the page can draw its glyphs,
+    // which makes it display text, not keys: on the PTY those bytes are C1
+    // controls.  Re-checked here, on the one path from a row to the wire,
+    // and refused whole -- an action with a byte missing is a different
+    // command.  The label is not printed: it may carry the same bytes.
+    if (!project_action_keyable(body)) {
+        status("do: refused an action with characters the DS cannot type");
+        return;
+    }
     if (!ui_settings.god_mode) {
-        composer_load(&composer, body);
+        if (!composer_load(&composer, body)) {
+            status("do: that action does not fit the composer");
+            return;
+        }
         overlay_sync();
         status("do: %s -- A sends it", actions[index].label);
         return;
     }
-    // The decoder already bounded and sanitized this to printable ASCII, and
-    // the composer's own body limit is far larger than a row can carry, so the
-    // send below cannot be made to overrun by anything on the wire.
+    // Checked to printable ASCII just above, and the composer's own body
+    // limit is far larger than a row can carry, so the send below cannot be
+    // made to overrun or to carry a control byte by anything on the wire.
     const size_t len = strlen(body);
     if (!send_key_seq(body, len, tx)) return;
     if (!send_key_seq("\r", 1, tx)) return;
@@ -2528,30 +2914,34 @@ static void project_resync(void)
     }
     }
 
-    project_clear(&project, PROJECT_TAB_HEALTH);
-    (void)snprintf(v, sizeof(v), "%u%s", health_battery,
-                   health_external ? " (charging)" : "");
-    project_add(&project, PROJECT_TAB_HEALTH, "battery", v, 0);
-    if (health_rssi_known) {
-        (void)snprintf(v, sizeof(v), "%d", health_rssi);
-        project_add(&project, PROJECT_TAB_HEALTH, "wifi", v, 0);
+    if (!project_tab_from_server(&project, PROJECT_TAB_HEALTH)) {
+        project_clear(&project, PROJECT_TAB_HEALTH);
+        (void)snprintf(v, sizeof(v), "%u%s", health_battery,
+                       health_external ? " (charging)" : "");
+        project_add(&project, PROJECT_TAB_HEALTH, "battery", v, 0);
+        if (health_rssi_known) {
+            (void)snprintf(v, sizeof(v), "%d", health_rssi);
+            project_add(&project, PROJECT_TAB_HEALTH, "wifi", v, 0);
+        }
+        (void)snprintf(v, sizeof(v), "%u ms%s", rtt_ms, rtt_known ? "" : " (stale)");
+        project_add(&project, PROJECT_TAB_HEALTH, "round trip", v, 0);
+        (void)snprintf(v, sizeof(v), "%lu", last_loops);
+        project_add(&project, PROJECT_TAB_HEALTH, "frames", v, 0);
+        (void)snprintf(v, sizeof(v), "%um %02us", uptime_s / 60u, uptime_s % 60u);
+        project_add(&project, PROJECT_TAB_HEALTH, "up", v, 0);
     }
-    (void)snprintf(v, sizeof(v), "%u ms%s", rtt_ms, rtt_known ? "" : " (stale)");
-    project_add(&project, PROJECT_TAB_HEALTH, "round trip", v, 0);
-    (void)snprintf(v, sizeof(v), "%lu", last_loops);
-    project_add(&project, PROJECT_TAB_HEALTH, "frames", v, 0);
-    (void)snprintf(v, sizeof(v), "%um %02us", uptime_s / 60u, uptime_s % 60u);
-    project_add(&project, PROJECT_TAB_HEALTH, "up", v, 0);
 
-    project_clear(&project, PROJECT_TAB_LOG);
-    (void)snprintf(v, sizeof(v), "%lu", last_rx);
-    project_add(&project, PROJECT_TAB_LOG, "bytes in", v, 0);
-    (void)snprintf(v, sizeof(v), "%lu", last_tx);
-    project_add(&project, PROJECT_TAB_LOG, "bytes out", v, 0);
-    (void)snprintf(v, sizeof(v), "%lu", last_msg);
-    project_add(&project, PROJECT_TAB_LOG, "messages", v, 0);
-    (void)snprintf(v, sizeof(v), "%um %02us", uptime_s / 60u, uptime_s % 60u);
-    project_add(&project, PROJECT_TAB_LOG, "connected", v, 0);
+    if (!project_tab_from_server(&project, PROJECT_TAB_LOG)) {
+        project_clear(&project, PROJECT_TAB_LOG);
+        (void)snprintf(v, sizeof(v), "%lu", last_rx);
+        project_add(&project, PROJECT_TAB_LOG, "bytes in", v, 0);
+        (void)snprintf(v, sizeof(v), "%lu", last_tx);
+        project_add(&project, PROJECT_TAB_LOG, "bytes out", v, 0);
+        (void)snprintf(v, sizeof(v), "%lu", last_msg);
+        project_add(&project, PROJECT_TAB_LOG, "messages", v, 0);
+        (void)snprintf(v, sizeof(v), "%um %02us", uptime_s / 60u, uptime_s % 60u);
+        project_add(&project, PROJECT_TAB_LOG, "connected", v, 0);
+    }
 
     // The three the server owns.  Saying which side is missing is the useful
     // half of an empty page: "not reported" is a fact about the server, and
@@ -2575,12 +2965,33 @@ static void project_resync(void)
         project_render(&project, &page_grid);
     }
 
-    char lines[2][44];
+    char lines[6][44];
+    unsigned line_count = 2;
     (void)snprintf(lines[0], sizeof(lines[0]), "%s", project_tab_name(
         project_tab(&project)));
-    (void)snprintf(lines[1], sizeof(lines[1]),
-                   "tap a tab   X BACK");
-    subscreen_set_project((unsigned)project_tab(&project), lines, 2);
+    (void)snprintf(lines[1], sizeof(lines[1]), "%s", tr(TR_PROJECT_HINT));
+    if (project_tab(&project) == PROJECT_TAB_HEALTH &&
+        project_tab_from_server(&project, PROJECT_TAB_HEALTH)) {
+        lines[2][0] = '\0';
+        (void)snprintf(lines[3], sizeof(lines[3]),
+                       "DS bat %u%s   wifi %d   rtt %u ms",
+                       health_battery, health_external ? "+" : "",
+                       health_rssi_known ? health_rssi : 0, rtt_ms);
+        (void)snprintf(lines[4], sizeof(lines[4]),
+                       "DS uptime %um %02us   frames %lu",
+                       uptime_s / 60u, uptime_s % 60u, last_loops);
+        line_count = 5;
+    } else if (project_tab(&project) == PROJECT_TAB_LOG &&
+               project_tab_from_server(&project, PROJECT_TAB_LOG)) {
+        lines[2][0] = '\0';
+        (void)snprintf(lines[3], sizeof(lines[3]),
+                       "DS in %lu B   out %lu B", last_rx, last_tx);
+        (void)snprintf(lines[4], sizeof(lines[4]),
+                       "DS msgs %lu   up %um %02us",
+                       last_msg, uptime_s / 60u, uptime_s % 60u);
+        line_count = 5;
+    }
+    subscreen_set_project((unsigned)project_tab(&project), lines, line_count);
     project_action_t actions[PROJECT_ACTIONS_MAX];
     const unsigned action_count = project_actions(&project, actions,
                                                   PROJECT_ACTIONS_MAX);
@@ -2686,13 +3097,10 @@ static void control_press(kbd_control_t hit, unsigned long *tx)
     case KBD_CONTROL_COMPOSE:
         // Overlays own every input while open, so focus yields to them.
         if (focus_active()) focus_off();
-        composer_open(&composer);
         // Always the buffer first.  The snippets pane is one Y away, and a
         // tile that opened onto a list some of the time would be a tile whose
         // behaviour depends on what you did the last time you used it.
-        composer_pane = COMPOSER_PANE_WRITE;
-        snippet_pick = 0;
-        snippet_focus = 0;
+        composer_open_write();
         overlay_sync();
         break;
 
@@ -2807,6 +3215,7 @@ static void poll_touch(unsigned long *tx)
                         quick_activate(tx);
                     } else {
                         quick_sel = at;
+                        quick_remove_armed = 0;
                         chime_focus();
                         overlay_sync();
                     }
@@ -2914,9 +3323,18 @@ static void poll_touch(unsigned long *tx)
                     }
                 }
             } else if (composing) {
-                touch_key = kbd_hit(pos.px, pos.py);
-                kbd_set_held(touch_key);
-                if (touch_key >= 0) composer_key(touch_key);
+                if (voice_bar_hit(pos.px, pos.py) && mic_can_transcribe()) {
+                    touch_key = -1;
+                    kbd_set_held(-1);
+                    if (!mic_recording() && !mic_waiting()) {
+                        mic_touch_held = 1;
+                        (void)mic_start(lang_voice_code(ui_settings.language), tx);
+                    }
+                } else {
+                    touch_key = kbd_hit(pos.px, pos.py);
+                    kbd_set_held(touch_key);
+                    if (touch_key >= 0) composer_key(touch_key);
+                }
             } else {
                 touch_key = kbd_hit(pos.px, pos.py);
                 kbd_set_held(touch_key);
@@ -2934,6 +3352,10 @@ static void poll_touch(unsigned long *tx)
         // A contact must have two matching settled readings before it applies;
         // lift only ends the sample window. Headings and empty rows remain
         // inert as well.
+        if (mic_touch_held) {
+            mic_touch_held = 0;
+            if (mic_recording()) mic_stop(tx);
+        }
         ext_touch_up();
         kbd_set_held(-1);
         refresh_sub();
@@ -3072,7 +3494,13 @@ static void focus_input(unsigned raw, unsigned edge, unsigned long *tx)
 
     // SELECT leaves focus and cycles the screen, so the new screen never
     // inherits a cursor that describes the old one.
-    if (edge & KEY_SELECT) { focus_off(); status_mode_next(); refresh_sub(); return; }
+    if (edge & KEY_SELECT) {
+        select_cycled_from = (int)status_mode_get();
+        focus_off();
+        status_mode_next();
+        refresh_sub();
+        return;
+    }
 
     const unsigned dp = raw & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
     if (dp != focus_held) {
@@ -3118,15 +3546,171 @@ static void focus_step(unsigned dp, unsigned long *tx)
     refresh_sub();
 }
 
+
+// ------------------------------------------------------------ CONTROLS ---
+
+// The guide's state: guide.c decides what every press means; this is the
+// thin part that reads the card's settings for it, feeds it the key word,
+// and draws what it decided.
+static guide_t guide;
+static guide_config_t guide_cfg;
+static unsigned guide_held;
+static unsigned guide_touch_frames;
+
+static void guide_config_fill(void)
+{
+    // Read every time: a remap on Settings' BUTTONS tab shows at once.
+    guide_cfg.map = &ui_settings.buttons;
+    guide_cfg.shutter = ui_settings.camera_shutter;
+    guide_cfg.latch = ui_settings.mic_mode == SETTINGS_MIC_LATCH;
+    guide_cfg.talk = mic_can_transcribe();
+    guide_cfg.camera = photo_available();
+}
+
+static void guide_sync(void)
+{
+    subscreen_set_guide(guide_open, &guide, &guide_cfg, boot_console_family(),
+                        guide_held);
+    refresh_sub();
+}
+
+// The top screen while the guide is up: the still session, and the pop-up
+// over it when there is one.  Nothing here is read from the PTY.
+static void guide_paint_top(void)
+{
+    static grid_t session;
+    static int filled = 0;
+    if (!filled) {
+        guide_session_fill(&session);
+        filled = 1;
+    }
+    render_overlay_grid(&session);
+    if (!guide.shown) return;
+    static char lines[GUIDE_POPUP_LINES][GUIDE_LINE_MAX];
+    const unsigned n = guide_popup_lines(&guide.entry, lines);
+    const char *rows[GUIDE_POPUP_LINES];
+    for (unsigned i = 0; i < GUIDE_POPUP_LINES; i++) rows[i] = lines[i];
+    const uint16_t colours[GUIDE_POPUP_LINES] = {
+        render_palette_rgb(PAL_ORANGE), render_palette_rgb(PAL_WHITE),
+        render_palette_rgb(PAL_DEFAULT), render_palette_rgb(PAL_DEFAULT),
+    };
+    int x, y, w, h;
+    guide_popup_rect(n, &x, &y, &w, &h);
+    render_overlay_box(x, y, w, h, rows, colours, (int)n, GUIDE_POPUP_PITCH);
+}
+
+static void guide_show(guide_ctx_t ctx)
+{
+    guide_config_fill();
+    guide_init(&guide, ctx, &guide_cfg);
+    guide_open = 1;
+    guide_held = 0;
+    // The contact that opened it (a QUICK row, a Settings chip) is still
+    // down: it must not also press a tab or DONE where it happens to rest.
+    guide_touch_frames = 2;
+    kbd_set_held(-1);
+    guide_sync();
+    overlay_sync();
+}
+
+// Buttons held when the guide closed: ignored until released (poll_input).
+static unsigned held_past_guide;
+
+static void guide_close(unsigned raw)
+{
+    guide_open = 0;
+    subscreen_set_guide(0, NULL, NULL, CONSOLE_UNKNOWN, 0);
+    // Whatever is still held was pressed for the guide.  None of it may
+    // land on the screen underneath once that screen has the keys back: a
+    // held direction waits for its release, and a pen still down does not
+    // become a fresh tap on whatever is under it.
+    held_past_guide = raw & (KEY_A | KEY_B | KEY_X | KEY_Y | KEY_L | KEY_R |
+                             KEY_START | KEY_SELECT);
+    const unsigned dp = raw & (KEY_UP | KEY_DOWN | KEY_LEFT | KEY_RIGHT);
+    dpad_suppressed = dp != 0;
+    dpad_held = dp;
+    dpad_frames = 0;
+    focus_held = dp;
+    composer_focus_held = dp;
+    quick_held = raw & (KEY_UP | KEY_DOWN);
+    if (touch_held()) {
+        touch_was_down = 1;
+        touch_frames = 2;
+        touch_key = -1;
+    }
+    page_repaint();
+    overlay_sync();
+}
+
+// SELECT held, then START -- or both in the same frame. Never START first:
+// by the time SELECT joins it, START's own action (Ctrl-C by default, Enter
+// if remapped) has already gone to the session, so opening the guide then
+// would teach the chord by interrupting Claude. START first stays START.
+static int guide_chord(unsigned raw, unsigned edge)
+{
+    return (edge & KEY_START) && (raw & KEY_SELECT);
+}
+
+// The guide's only touch targets: the context tabs and DONE.
+static void guide_touch(unsigned raw)
+{
+    const int down = touch_held();
+    if (down && !touch_was_down) {
+        guide_touch_frames = 0;        // first frame: garbage coordinate
+    } else if (down && ++guide_touch_frames == 1) {
+        touchPosition pos;
+        touch_read(&pos);
+        if (guide_done_hit(pos.px, pos.py)) {
+            touch_was_down = 1;
+            guide_close(raw);
+            return;
+        }
+        const guide_ctx_t hit = guide_tab_hit(&guide_cfg, pos.px, pos.py);
+        if (hit != GUIDE_CTX_COUNT && hit != guide.ctx) {
+            guide_set_ctx(&guide, hit, &guide_cfg);
+            chime_focus();
+            guide_sync();
+        }
+    }
+    touch_was_down = down;
+}
+
+// Every press while the guide is up comes here and nowhere else.
+static void guide_input(unsigned raw, unsigned edge)
+{
+    guide_config_fill();
+    const guide_step_t step = guide_step(&guide, &guide_cfg, raw, edge);
+    if (step == GUIDE_STEP_LEAVE) {
+        guide_close(raw);
+        return;
+    }
+    guide_touch(raw);
+    if (!guide_open) return;
+    if (step == GUIDE_STEP_CONTEXT) chime_focus();
+    if (step == GUIDE_STEP_SHOW || step == GUIDE_STEP_CONTEXT) overlay_dirty = 1;
+    if (guide_tick(&guide)) overlay_dirty = 1;
+    if (raw != guide_held || step != GUIDE_STEP_NONE) {
+        guide_held = raw;
+        guide_sync();
+    }
+}
+
 // Returns the combined newly-pressed word so the caller can show it.
 static int poll_input(unsigned long *tx)
 {
-    const unsigned raw = kbd_held_keyword((unsigned)(~REG_KEYINPUT), keysHeld());
-    const unsigned edge = kbd_edge_keyword(raw, prev_raw);
+    const unsigned raw_all = kbd_held_keyword((unsigned)(~REG_KEYINPUT), keysHeld());
+    const unsigned edge_all = kbd_edge_keyword(raw_all, prev_raw);
+    prev_raw = raw_all;
+    // A button still held when the guide closed was pressed for the guide.
+    // It counts as up until it is let go, so a B held to leave cannot go on
+    // to repeat spaces into the session from focus, nor a held A or START
+    // send Enter or Ctrl-C to the screen underneath.
+    held_past_guide &= raw_all;
+    const unsigned raw = raw_all & ~held_past_guide;
+    const unsigned edge = edge_all & ~held_past_guide;
     // The raw edge is returned to the caller for diagnostics.  Focus may
     // consume shoulders from its private copy when L+R is a mode chord.
     unsigned focus_edge = edge;
-    prev_raw = raw;
 
     // A deliberate press wakes the extension's quiet clock even when it is only a
     // local modifier or belongs to an overlay. Key repeats are not separate
@@ -3134,6 +3718,18 @@ static int poll_input(unsigned long *tx)
     if (edge) {
         chime_user_activity();
         ext_event(EXT_EVENT_LOCAL_INPUT);
+    }
+    if (!(raw & KEY_SELECT)) select_cycled_from = -1;
+
+    // The controls guide owns every control while it is open, ahead of every
+    // other dispatch, and returns before any of them.  That is its safety
+    // property: a person learning the buttons by pressing them is shown what
+    // each would do, and nothing reaches the PTY, the composer or the camera
+    // -- no Enter, no Esc, no Ctrl-C, no shutter.  Touch is the guide's too
+    // (its tabs and DONE): poll_touch() is not called.
+    if (guide_open) {
+        guide_input(raw, edge);
+        return (int)edge;
     }
 
     // A local overlay owns every control while it is open, and nothing past
@@ -3143,6 +3739,22 @@ static int poll_input(unsigned long *tx)
     if (composer.mode != COMPOSER_CLOSED) {
         composer_input(raw, edge, tx);
         poll_touch(tx);
+        return (int)edge;
+    }
+    // SELECT, then START, opens the guide from anywhere but the composer
+    // (above, whose keys it would shadow mid-prompt) and the camera.
+    // SELECT's own press cycled the screen, which is put back, so the guide
+    // opens over where you were. START first is never the chord (guide_chord).
+    if (!photo_is_open() && guide_chord(raw, edge)) {
+        if (select_cycled_from >= 0) {
+            if (focus_active()) focus_off();
+            status_mode_set((screen_mode_t)select_cycled_from);
+            select_cycled_from = -1;
+            page_repaint();
+        }
+        guide_show(guide_ctx_for(status_mode_get() == SCREEN_MODE_KEYS,
+                                 focus_active(),
+                                 quick_menu || remote_menu || ext_menu_is_open()));
         return (int)edge;
     }
     if (quick_menu) {
@@ -3261,6 +3873,7 @@ static int poll_input(unsigned long *tx)
     // Local only -- no bytes are sent -- so it is handled here rather than in
     // the key table below.
     if (edge & KEY_SELECT) {
+        select_cycled_from = (int)status_mode_get();
         status_mode_next();
         page_repaint();
         // Not just the sub screen any more: PROJECT owns the top one too, so
@@ -3290,7 +3903,7 @@ static int poll_input(unsigned long *tx)
             settings_chip_press((settings_row_t)ui_settings_ui.row,
                                 ui_settings_ui.option, tx);
         }
-        // L and R step between the two tabs.  Both together stay the focus
+        // L and R step between the five tabs.  Both together stay the focus
         // chord they are everywhere else.
         if ((edge & (KEY_L | KEY_R)) && (raw & (KEY_L | KEY_R)) != (KEY_L | KEY_R)) {
             const unsigned tab = settings_row_tab((settings_row_t)ui_settings_ui.row);
@@ -3794,7 +4407,7 @@ static void handle_message(msg_type_t type, const uint8_t *payload, uint16_t len
             break;
         }
         photo_ready(can_save);
-        quick_set_photo_note(can_save ? NULL : "cannot save pictures here");
+        quick_set_photo_note(can_save ? TR_COUNT : TR_QUICK_NOTE_NO_SAVE);
         if (quick_menu) overlay_sync();
         break;
     }
@@ -3872,6 +4485,64 @@ static void handle_message(msg_type_t type, const uint8_t *payload, uint16_t len
             break;
         }
         camera_saved(&saved);
+        break;
+    }
+
+    case MSG_MIC_READY: {
+        int can_stt = 0;
+        if (proto_decode_mic_ready(&can_stt, payload, len) != PROTO_OK) {
+            status("ignored a malformed mic ready");
+            break;
+        }
+        mic_ready(can_stt);
+        quick_set_voice_note(can_stt ? TR_COUNT : TR_QUICK_NOTE_NO_STT);
+        if (quick_menu || composer.mode != COMPOSER_CLOSED) overlay_sync();
+        break;
+    }
+
+    case MSG_VOICE_ACK: {
+        uint32_t acked = 0;
+        if (proto_decode_voice_ack(&acked, payload, len) != PROTO_OK) {
+            // Still owed and still paid: see mic_ack_malformed().
+            status("ignored a malformed voice ack");
+            mic_ack_malformed();
+            break;
+        }
+        // Never a reconnect: a late ack -- after X, or after the next
+        // utterance began -- is well formed and merely late (mic.c).
+        mic_ack(acked);
+        break;
+    }
+
+    case MSG_VOICE_TEXT: {
+        // Static: about 490 bytes, too big for the ARM9 stack.  Messages are
+        // handled one at a time from the main loop, so nothing re-enters.
+        static voice_text_t vt;
+        if (proto_decode_voice_text(&vt, payload, len) != PROTO_OK) {
+            // The reply the last VOICE_END was owed, unreadable: pay the
+            // ledger so the next recording is not refused (mic.h).
+            mic_text_malformed();
+            overlay_sync();
+            break;
+        }
+        // Only the utterance this card is waiting on gets through, and its
+        // words land in the composer to be read -- never on the PTY.
+        if (mic_text_arrived(&vt)) {
+            if (composer.mode == COMPOSER_CLOSED) {
+                if (focus_active()) focus_off();
+                composer_open_write();
+            }
+            // The composer's limit cuts the tail; say so, or the person sends
+            // half a sentence believing it whole.
+            const size_t landed = composer_append_text(&composer, vt.text,
+                                                       vt.text_len);
+            if (landed < vt.text_len) {
+                status("voice: composer full -- transcript cut, A sends it");
+            } else {
+                status("voice: transcribed -- A sends it");
+            }
+        }
+        overlay_sync();
         break;
     }
 
@@ -4055,7 +4726,10 @@ int main(void)
         settings_set_camera_available(photo_available());
         subscreen_set_camera_available(photo_available());
         // Until a CAMERA_READY proves otherwise, PHOTO's note is the truth.
-        quick_set_photo_note("not on this computer");
+        quick_set_photo_note(TR_QUICK_NOTE_NOT_HERE);
+        quick_set_voice_note(TR_QUICK_NOTE_NOT_HERE);
+        lang_init();
+        load_custom_langs();
         settings_ui_init(&ui_settings_ui);
         if (!settings_load(settings_path, &ui_settings, serr, sizeof(serr))) {
             settings_defaults(&ui_settings);
@@ -4094,6 +4768,7 @@ int main(void)
     // QUICK's lists: the built-in commands until a computer adds its own, and
     // the prompts you sent last time.
     quick_commands_init(&commands);
+    quick_saved_load();
     recent_load();
 
     // Snippets are optional. A console without them is not misconfigured, so
@@ -4178,7 +4853,7 @@ int main(void)
     link_refresh();
     refresh_sub();
 
-    uint8_t chunk[1024];
+    static uint8_t chunk[1024];
     unsigned long n_rx = 0, n_msg = 0, n_tx = 0;
     unsigned acc_raw = 0, acc_lib = 0;
 
@@ -4198,6 +4873,7 @@ int main(void)
         if (inject_frames > 0) inject_frames--;
         remote_tick();
         if (photo_is_open()) photo_tick(&n_tx);
+        mic_tick(&n_tx);
         mirror_tick(&n_tx);
 
         // Once a second: probe the round trip, re-read battery and signal, and

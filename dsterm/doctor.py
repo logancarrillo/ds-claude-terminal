@@ -9,6 +9,7 @@ no secrets: the key's presence and permissions, never the key.
 from __future__ import annotations
 
 import json
+import os
 import platform
 import re
 import shutil
@@ -40,6 +41,47 @@ def service_path() -> str | None:
                       (cli.DATA / "dsterm.service").read_text(), re.M)
         return m.group(1).replace("%h", home) if m else None
     return None
+
+# What `dsterm doctor` suggests for a local speech-to-text library: the same
+# commands docs/USING.md gives, since a pipx install has its own venv and a
+# bare `pip install` would put the library somewhere dsterm cannot import it.
+STT_INSTALL_HINT = ("pipx inject ds-claude-terminal faster-whisper (or "
+                    "mlx-whisper on Apple silicon, with ffmpeg)")
+
+
+def serve_env(env_path: Path | None = None) -> tuple[dict[str, str], str | None]:
+    """(the environment `dsterm serve` would choose a backend from, a problem
+    with the env file or None).
+
+    The same merge serve.py makes: this process's environment with the env
+    file over it, so a DSTERM_STT_CMD or DSTERM_STT_URL set only in the file
+    is seen here as it is there. A file serve would refuse is reported, and
+    the inherited environment used alone."""
+    from . import serve
+
+    path = env_path if env_path is not None else serve.DEFAULT_ENV_PATH
+    env = dict(os.environ)
+    try:
+        env.update(serve.load_env_file(path))
+    except (OSError, ValueError) as exc:
+        return env, str(exc)
+    return env, None
+
+
+def voice_check(env: dict[str, str]) -> tuple[str, str]:
+    """(level, detail) for the voice line, decided as `dsterm serve` started
+    from this shell would decide it. The cloud opt-in is read from this
+    process's environment, never the file (voice.cloud_opted_in)."""
+    from . import voice as dsvoice
+
+    backend, where = dsvoice.choose_backend(
+        env, cloud=dsvoice.cloud_opted_in(False))
+    if backend is not None:
+        return OK, f"Push-to-Talk: {where}"
+    # `where` carries the real reason ("off: --stt-cloud is on, but ..."), so
+    # it is printed, followed by what would turn voice on.
+    return OK, f"Push-to-Talk {where} -- optional: {STT_INSTALL_HINT}"
+
 
 def _version() -> str:
     try:
@@ -150,6 +192,16 @@ def checks():
     window = pairing.current_window()
     if window:
         yield OK, "pairing", f"window open for {int(window.remaining())} s"
+
+    # Where a recording would go, as `dsterm serve` started from this shell
+    # would decide it: from the same environment, the env file merged over
+    # this one. A --stt-cloud in serve.conf is not seen from here, so the
+    # cloud case says what it depends on rather than guessing.
+    env, env_problem = serve_env()
+    if env_problem:
+        yield WARN, "env file", f"{env_problem} -- dsterm serve will refuse to start"
+    level, detail = voice_check(env)
+    yield level, "voice", detail
 
     if cli.is_wsl():
         mode = wsl.networking_mode()

@@ -20,9 +20,11 @@ from dsterm import project
 from dsterm.protocol import (
     PROJECT_LABEL_MAX,
     PROJECT_ROWS_MAX,
+    PROJECT_ROWS_MAX_V1,
     PROJECT_TAB_COUNT,
     PROJECT_TAB_DIFF,
     PROJECT_TAB_NOW,
+    PROJECT_TAB_WATCH,
     PROJECT_VALUE_MAX,
     FrameReader,
     MsgType,
@@ -318,7 +320,7 @@ class TestThePageNeverStallsTheFrameLoop:
 
     def _blocking_collect(self, release, calls, rows=()):
         """A collect() that hangs until the test lets it finish."""
-        def fake(cwd, quiet_s=None):
+        def fake(cwd, quiet_s=None, ci=False):
             calls.append(cwd)
             release.wait(timeout=5.0)
             return rows
@@ -382,7 +384,7 @@ class TestThePageNeverStallsTheFrameLoop:
         # a quiet repository off the wire, so an unchanged re-collection is
         # silence, not a repeat.
         rows = (project.Row(PROJECT_TAB_NOW, "branch", "main"),)
-        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None: rows)
+        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None, ci=False: rows)
         collector = project.BackgroundCollector("/anywhere", interval=0.0)
         try:
             assert self._poll_until_change(collector) is True
@@ -398,7 +400,7 @@ class TestThePageNeverStallsTheFrameLoop:
         # Failure is silence, and silence must not also mean a dead poller: the
         # page keeps its last honest answer and the next tick still works.
         rows = (project.Row(PROJECT_TAB_NOW, "branch", "main"),)
-        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None: rows)
+        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None, ci=False: rows)
         collector = project.BackgroundCollector("/anywhere", interval=0.0)
         try:
             assert self._poll_until_change(collector) is True
@@ -416,7 +418,7 @@ class TestThePageNeverStallsTheFrameLoop:
             collector.stop()
 
     def test_stop_is_idempotent_and_polling_after_it_is_inert(self, monkeypatch):
-        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None: ())
+        monkeypatch.setattr(project, "collect", lambda cwd, quiet_s=None, ci=False: ())
         collector = project.BackgroundCollector("/anywhere", interval=0.0)
         collector.poll()
         collector.stop()
@@ -523,3 +525,223 @@ class TestTheQuietRowReadsHonestly:
         monkeypatch.setattr(project, "_git", lambda cwd, *a: "/tmp/repo")
         rows = project.collect("/tmp/repo")
         assert not [r for r in rows if r.label == "quiet for"]
+
+
+class TestDeclarativeWatchAndSparklines:
+    def test_sparkline_and_progress_bar_round_trip_on_wire(self):
+        sp = project.sparkline([0, 1, 2, 3, 4, 5, 6, 7], width=8)
+        assert sp == "▁▂▃▄▅▆▇█"
+        pb = project.progress_bar(50.0, width=8)
+        assert pb == "████░░░░"
+        frame = encode_project_row(0, 1, PROJECT_TAB_WATCH, 3,
+                                   "latency", f"{sp} 12ms")
+        assert decode_project_row(only(frame).payload) == (
+            1, 0, PROJECT_TAB_WATCH, 3, "latency", f"{sp} 12ms"
+        )
+
+    def test_declarative_watch_json_and_timer_populate_watch_tab(self, tmp_path):
+        import json
+
+        repo = TestGathering._repo(tmp_path)
+        dsterm_dir = repo / ".dsterm"
+        dsterm_dir.mkdir()
+        (dsterm_dir / "watch.json").write_text(json.dumps([
+            {"label": "gateway", "value": "11ms", "spark": [9, 10, 12, 11], "color": "green"},
+            {"label": "deploy", "value": "staging", "progress": 75, "color": "orange"},
+        ]), encoding="utf-8")
+        (dsterm_dir / "timer.json").write_text(json.dumps({
+            "label": "pomodoro",
+            "duration_s": 1500,
+            "end_ts": time.time() + 600,
+        }), encoding="utf-8")
+
+        rows = project.collect(str(repo))
+        watch_rows = {r.label: r for r in rows if r.tab == PROJECT_TAB_WATCH}
+        assert "gateway" in watch_rows
+        assert "11ms" in watch_rows["gateway"].value
+        assert "deploy" in watch_rows
+        assert "pomodoro" in watch_rows
+        assert "left" in watch_rows["pomodoro"].value
+
+
+    def test_one_bad_spark_or_progress_costs_its_row_not_the_file(self, tmp_path):
+        import json
+
+        repo = TestGathering._repo(tmp_path)
+        (repo / ".dsterm").mkdir()
+        (repo / ".dsterm" / "watch.json").write_text(json.dumps([
+            {"label": "good", "value": "1", "spark": [1, 2, 3]},
+            {"label": "words", "value": "2", "spark": ["a", "b"]},
+            {"label": "nan", "value": "3", "progress": "NaN"},
+            {"label": "inf", "value": "4", "progress": 1e400},
+            {"label": "also good", "value": "5", "progress": 40},
+        ]), encoding="utf-8")
+        labels = [r.label for r in project.collect(str(repo))
+                  if r.tab == PROJECT_TAB_WATCH]
+        assert labels == ["good", "also good"]
+
+    @pytest.mark.parametrize("body", [
+        "[]", "null", '"x"', "3", "true",
+        '{"end_ts": 1e400}', '{"end_ts": "soon"}', '{"end_ts": NaN}',
+        '{"end_ts": [1]}', "{not json",
+    ])
+    def test_a_bad_timer_file_costs_its_row_not_the_page(self, tmp_path, body):
+        # Valid JSON of the wrong shape once raised AttributeError out of
+        # collect(), and BackgroundCollector kept the last snapshot forever.
+        import json
+
+        repo = TestGathering._repo(tmp_path)
+        (repo / ".dsterm").mkdir()
+        (repo / ".dsterm" / "timer.json").write_text(body, encoding="utf-8")
+        (repo / ".dsterm" / "watch.json").write_text(json.dumps([
+            {"label": "still here", "value": "1"},
+        ]), encoding="utf-8")
+        rows = project.collect(str(repo))
+        labels = [r.label for r in rows if r.tab == PROJECT_TAB_WATCH]
+        assert labels == ["still here"]
+        assert any(r.tab != PROJECT_TAB_WATCH for r in rows)
+
+    @pytest.mark.parametrize("body", ["null", '"x"', "3", "{}"])
+    def test_a_watch_file_of_the_wrong_shape_is_no_rows(self, tmp_path, body):
+        repo = TestGathering._repo(tmp_path)
+        (repo / ".dsterm").mkdir()
+        (repo / ".dsterm" / "watch.json").write_text(body, encoding="utf-8")
+        rows = project.collect(str(repo))
+        assert [r for r in rows if r.tab == PROJECT_TAB_WATCH] == []
+
+
+class TestCiIsOptIn:
+    def test_without_project_ci_gh_is_never_run(self, tmp_path, monkeypatch):
+        repo = TestGathering._repo(tmp_path)
+        subprocess.run(["git", "remote", "add", "origin",
+                        "https://github.com/example/example.git"],
+                       cwd=repo, check=True)
+        project._CI_CACHE.clear()
+        ran = []
+        real_run = subprocess.run
+
+        def spy(argv, *a, **k):
+            if argv and str(argv[0]).endswith("gh"):
+                ran.append(argv)
+                return subprocess.CompletedProcess(argv, 0, "[]", "")
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(project.shutil, "which", lambda name: "/usr/bin/gh")
+        monkeypatch.setattr(project.subprocess, "run", spy)
+        project.collect(str(repo))
+        assert ran == []
+        project.collect(str(repo), ci=True)
+        assert ran and ran[0][1:3] == ["run", "list"]
+        project._CI_CACHE.clear()
+
+    @pytest.mark.parametrize("answer", [
+        "{}", "null", '"x"', '["a", 1, null]', '{"name": "ci"}',
+        '[{"name": "build", "status": "completed", "conclusion": "success"}, 7]',
+    ])
+    def test_a_strange_gh_answer_never_freezes_the_page(
+            self, tmp_path, monkeypatch, answer):
+        repo = TestGathering._repo(tmp_path)
+        subprocess.run(["git", "remote", "add", "origin",
+                        "https://github.com/example/example.git"],
+                       cwd=repo, check=True)
+        project._CI_CACHE.clear()
+        real_run = subprocess.run
+
+        def fake(argv, *a, **k):
+            if argv and str(argv[0]).endswith("gh"):
+                return subprocess.CompletedProcess(argv, 0, answer, "")
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(project.shutil, "which", lambda name: "/usr/bin/gh")
+        monkeypatch.setattr(project.subprocess, "run", fake)
+        try:
+            rows = project.collect(str(repo), ci=True)
+        finally:
+            project._CI_CACHE.clear()
+        labels = [r.label for r in rows if r.tab == PROJECT_TAB_WATCH]
+        assert labels in ([], ["build"])
+
+
+def _rows_of_every_tab(n_each: int) -> tuple:
+    """n_each rows on each of the six tabs, with glyphs in them."""
+    rows = []
+    for tab in range(PROJECT_TAB_COUNT):
+        for i in range(n_each):
+            rows.append(project.Row(tab, f"t{tab}r{i}", f"{project.sparkline([1, 5, 9])} ✓ {i}"))
+    return tuple(rows)
+
+
+class TestOldCardsGetWhatTheyAccept:
+    """A 1.0.x card (no "project64") refuses a snapshot over 48 rows and
+    draws the glyph bytes as '?'. It is sent at most 48 rows, NOW, DIFF and
+    DO first, in printable ASCII."""
+
+    def _decoded(self, frames):
+        return [decode_project_row(only(f).payload) for f in frames]
+
+    def test_a_project64_card_gets_every_row_and_its_glyphs(self):
+        rows = _rows_of_every_tab(11)[:PROJECT_ROWS_MAX]
+        got = self._decoded(project.encode(rows, project64=True))
+        assert len(got) == PROJECT_ROWS_MAX
+        assert any("✓" in value for *_, value in got)
+
+    def test_an_old_card_gets_48_rows_the_old_tabs_first(self):
+        rows = _rows_of_every_tab(11)[:PROJECT_ROWS_MAX]   # 64: LOG has 9
+        frames = project.encode(rows, project64=False)
+        got = self._decoded(frames)
+        assert len(got) == PROJECT_ROWS_MAX_V1
+        assert all(count == PROJECT_ROWS_MAX_V1 for count, *_ in got)
+        tabs = [tab for _, _, tab, *_ in got]
+        # NOW, DIFF, DO whole (33), WATCH whole (11), then HEALTH's first 4.
+        assert tabs.count(0) == tabs.count(1) == tabs.count(2) == 11
+        assert tabs.count(3) == 11 and tabs.count(4) == 4 and 5 not in tabs
+        assert tabs == sorted(tabs)                          # original order kept
+        for frame in frames:
+            assert all(b < 0x80 for b in only(frame).payload[6:])
+
+    def test_an_old_card_sees_glyphs_folded_to_ascii(self):
+        rows = (project.Row(PROJECT_TAB_WATCH, "build",
+                            f"{project.sparkline([0, 1, 2, 3, 4, 5, 6, 7], 8)} ✓ pass"),
+                project.Row(PROJECT_TAB_WATCH, "deploy",
+                            f"{project.progress_bar(50, 8)} → staging"))
+        got = self._decoded(project.encode(rows, project64=False))
+        assert got[0][5] == "_.,-=+*# + pass"
+        assert got[1][5] == "####.... -> staging"
+
+    def test_a_small_snapshot_is_unchanged_but_for_the_folding(self):
+        rows = (project.Row(PROJECT_TAB_NOW, "branch", "main"),)
+        assert project.encode(rows, project64=False) == project.encode(rows)
+
+    def test_the_old_contract_is_enforced_by_the_encoder_too(self):
+        with pytest.raises(ProtocolError):
+            encode_project_row(0, PROJECT_ROWS_MAX_V1 + 1, 0, 0, "a", "b",
+                               project64=False)
+        with pytest.raises(ProtocolError):
+            encode_project_row(0, 1, 0, 0, "a", "█", project64=False)
+        encode_project_row(0, 1, 0, 0, "a", "█", project64=True)
+
+    def test_the_server_honours_the_token(self):
+        from dsterm.connection import ClientState
+        from dsterm.protocol import FEATURE_PROJECT64
+
+        assert FEATURE_PROJECT64 == "project64"
+        assert ClientState(None, ("t", 1), None, b"").caps.project64 is False
+
+    def test_the_server_sends_each_card_its_own_contract(self):
+        from dsterm.connection import ClientState
+        from dsterm.server import Server
+
+        srv = Server(["true"], b"k" * 16, host="127.0.0.1", port=0,
+                     voice_enabled=False)
+        rows = _rows_of_every_tab(11)[:PROJECT_ROWS_MAX]
+        srv._project._rows = rows
+        old = ClientState(None, ("old", 1), None, b"")
+        new = ClientState(None, ("new", 1), None, b"")
+        for c, wide in ((old, False), (new, True)):
+            c.caps.project = True
+            c.caps.project64 = wide
+            srv._clients.append(c)
+            srv._advertise_project(c)
+        assert len(old.outbox) == PROJECT_ROWS_MAX_V1
+        assert len(new.outbox) == PROJECT_ROWS_MAX
+        assert all(b < 0x80 for f in old.outbox for b in only(f).payload[6:])

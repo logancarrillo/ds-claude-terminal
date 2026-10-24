@@ -34,3 +34,6 @@ source/console.c
 source/privacy.c
 source/quick.c
 source/mirror.c
+source/lang.c
+source/voice.c
+source/guide.c

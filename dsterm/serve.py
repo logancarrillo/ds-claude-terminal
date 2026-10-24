@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 from dsterm import dashboard
+from dsterm import voice
 from dsterm.auth import DEFAULT_KEY_PATH, load_key
 from dsterm.grid import COLS, ROWS
 from dsterm.server import DEFAULT_PORT, Server
@@ -260,6 +261,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-camera-popup", action="store_true",
                    help="do not raise the viewfinder popup on the other tmux "
                         "clients while the camera is on")
+    p.add_argument("--no-mic", action="store_true",
+                   help="do not offer the DS's Push-to-Talk microphone: no "
+                        "MIC_READY, and any voice message drops the card")
+    # A flag (or DSTERM_STT_CLOUD=1 in this process's environment), never the
+    # env file: that file is the child's, and whether a recording leaves this
+    # computer is decided by how the server was started.
+    p.add_argument("--stt-cloud", action="store_true",
+                   help="allow speech-to-text in the cloud (OpenAI, Groq or "
+                        "DSTERM_STT_URL) when no local backend is installed. "
+                        "OFF by default: without it a recording is never "
+                        "uploaded, whatever API keys are set")
+    p.add_argument("--project-ci", action="store_true",
+                   help="show GitHub Actions runs on PROJECT -> WATCH, read "
+                        "with `gh run list` (a network call every 30 s)")
     p.add_argument("--no-keep-awake", action="store_true",
                    help="let the computer (macOS, Linux) idle to sleep even while a handheld "
                         "is connected (by default its idle sleep is held off "
@@ -354,7 +369,13 @@ def main(argv: list[str]) -> int:
                     camera_enabled=not args.no_camera,
                     photo_dir=args.photo_dir,
                     photo_keep=args.photo_keep,
-                    camera_popups=not args.no_camera_popup)
+                    camera_popups=not args.no_camera_popup,
+                    voice_enabled=not args.no_mic,
+                    voice_cloud=voice.cloud_opted_in(args.stt_cloud),
+                    project_ci=args.project_ci)
+    # Where a DS's recording goes, said at every start: a local backend by
+    # name, the cloud host when opted in, or off.
+    print(f"  voice: {server.voice_where}")
     for name, extension in load_extensions():
         # Whatever is installed beside this server and registered under the
         # dsterm.extensions entry point attaches here. Named at startup, so
@@ -369,6 +390,7 @@ def main(argv: list[str]) -> int:
               "synced to it) goes to the handheld")
     try:
         with server:
+            server.warm_voice()
             if args.dashboard_port:
                 # Started after the server so the page never shows a half-built
                 # one, and inside the context manager so it dies with it.

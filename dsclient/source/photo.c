@@ -154,7 +154,7 @@ static int cam_start_preview(void)
     return 1;
 }
 
-// SETTINGS -> CUSTOMIZE -> LIVE VIEW, as the wire's format byte.
+// SETTINGS -> LINK -> LIVE VIEW, as the wire's format byte.
 static int cam_view_format(void)
 {
     return host_settings()->liveview == SETTINGS_LIVEVIEW_COLOUR ? CAMERA_VIEW_COLOUR

@@ -76,7 +76,7 @@ def hello_vector(camera: bool = False, card_nonce: bool = False) -> str:
     from dsterm.protocol import hello_card_nonce, hello_device_id, hello_features
 
     payload = (b"ds-term/1 mode snippets project clip remote state seal seal3 "
-               b"commands mirror ask grid=42x24")
+               b"commands mirror ask mic project64 grid=42x24")
     if camera:
         payload += b" camera"
     payload += b" id=deadbeef"
@@ -85,7 +85,7 @@ def hello_vector(camera: bool = False, card_nonce: bool = False) -> str:
     features = hello_features(payload)
     assert hello_device_id(features) == "deadbeef"
     assert {"mode", "snippets", "project", "clip", "remote", "state", "seal",
-            "seal3", "commands", "mirror", "ask"} <= features
+            "seal3", "commands", "mirror", "ask", "mic", "project64"} <= features
     assert ("camera" in features) == camera
     assert hello_card_nonce(features) == (
         bytes(0x11 * i for i in range(16)) if card_nonce else None)
@@ -178,6 +178,34 @@ def commands_vector() -> str:
     payload = encode_commands(["/deploy", "/frontend:test", "/x.y_z-1"])[HEADER_SIZE:]
     assert payload == b"/deploy\n/frontend:test\n/x.y_z-1"
     return "|".join(decode_commands(payload)).encode().hex()
+
+
+def voice_adpcm_vector() -> str:
+    """test_core.c's 16-sample synthetic PCM encoded to 8 bytes of IMA ADPCM,
+    then decoded back to 16-bit PCM: proves both encoders and both decoders
+    agree bit for bit."""
+    import struct
+    from dsterm import voice as dsvoice
+
+    pcm = [i * 2000 - 15000 for i in range(16)]
+    encoded = dsvoice.adpcm_encode(pcm)
+    decoded = dsvoice.adpcm_decode(encoded)
+    return encoded.hex() + ":" + struct.pack(f"<{len(decoded)}h", *decoded).hex()
+
+
+def voice_wire_vector() -> str:
+    """VOICE_START, VOICE_CHUNK, and VOICE_END concatenated as hex."""
+    from dsterm.protocol import (
+        VOICE_FORMAT_IMA_ADPCM_8K,
+        encode_voice_chunk,
+        encode_voice_end,
+        encode_voice_start,
+    )
+
+    f1 = encode_voice_start(VOICE_FORMAT_IMA_ADPCM_8K, "es")
+    f2 = encode_voice_chunk(480, bytes((i * 17) & 0xFF for i in range(32)))
+    f3 = encode_voice_end(512, 0xDEADBEEF)
+    return (f1 + f2 + f3).hex()
 
 
 NONCE = bytes((0xF0 - i) & 0xFF for i in range(32))
@@ -276,6 +304,8 @@ def main() -> int:
         # QUICK's COMMANDS list as the card reads it back: the server's frame
         # payload, decoded by the card and printed name by name.
         "commands": commands_vector(),
+        "voice-adpcm": voice_adpcm_vector(),
+        "voice-wire": voice_wire_vector(),
     }
 
     failures = 0

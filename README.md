@@ -17,7 +17,7 @@ type prompts on the touch screen, from the couch.
 ![Encrypted](https://img.shields.io/badge/link-encrypted%20%2B%20signed-d97757?style=flat-square)
 ![License](https://img.shields.io/badge/license-MIT-3d3d3a?style=flat-square)
 
-[**Features**](#features) · [**Setup**](#setup) · [**Pairing**](#pairing) · [**Commands**](#commands) · [Using it](docs/USING.md) · [Under the hood](#under-the-hood) · [Troubleshooting](TROUBLESHOOTING.md)
+[**Features**](#features) · [**Controls guide**](#learn-the-buttons-the-controls-guide) · [**Setup**](#setup) · [**Pairing**](#pairing) · [**Commands**](#commands) · [Using it](docs/USING.md) · [Under the hood](#under-the-hood) · [Troubleshooting](TROUBLESHOOTING.md)
 
 </div>
 
@@ -40,8 +40,13 @@ DS sends can run a command or read a file.
   you something: in plain words on the bottom screen, and with a sound.
 - **Typing.** A touch keyboard that types live, a composer for prompts worth
   editing before they're sent, and snippets for the things you type often.
+  In the composer, hold **L**, then press **R**, and the d-pad types.
+- **Voice.** Hold **R** in the composer and speak; the words land in the
+  composer, to read before you send them. Transcribed by Whisper on your
+  computer; a cloud service only if you turn it on.
 - **QUICK.** Claude's mode on one tile (switch it with a tap), plus rewind,
-  the diff, every slash command (yours included) and your recent prompts.
+  the diff, every slash command (yours included), your own saved commands
+  (**+ ADD**) and your recent prompts.
 - **REMOTE.** Every Claude Code session on the computer, which are working
   and which need you; switch to one, start a new one, or move the DS to
   another computer on your network.
@@ -54,6 +59,11 @@ DS sends can run a command or read a file.
   down to jump back to now.
 - **Sounds.** The classic chip voice, a soft desk set with three variations
   of each sound, or your own WAV files. Or silence.
+- **A controls guide.** Hold **SELECT**, then press **START**: a drawing of
+  your console names every button and combo as you press it, and nothing
+  you press is sent.
+- **Four interface languages.** English, Spanish, Simplified Chinese or
+  Japanese, or one of your own. Claude's screen is not translated.
 - **Yours to set up.** Volume, typing clicks, four accent colours, the start
   screen, autoconnect, and A/B/X/Y/START mapped to the keys you want.
 
@@ -97,6 +107,35 @@ DS sends can run a command or read a file.
   <img src="docs/screens/camera.png" width="210" alt="The camera screen: aim, take a picture, send it to Claude">
   &nbsp;
   <img src="docs/screens/settings.png" width="210" alt="Settings: sound, volume, theme, start screen, autoconnect">
+</p>
+
+## Learn the buttons: the controls guide
+
+<p align="center">
+  <img src="docs/screens/controls-guide.png" width="260" alt="The controls guide: a drawing of the DSi below, with L and R lit, and a box over a Claude Code session saying L then R is FOCUS">
+</p>
+
+The DS can teach you its own buttons. Nothing you press in the guide is sent
+anywhere, so try anything.
+
+1. **Open it:** hold **SELECT**, then press **START**. (Or **QUICK →
+   CONTROLS**.)
+2. **Press any button or combo.** It lights up on a drawing of your console,
+   and a box on the top screen says what it does. The labels follow your own
+   button settings.
+3. **Pick a screen** with the tabs along the top (Control, KEYS, COMPOSE,
+   FOCUS, CAMERA, QUICK). **Leave** with **DONE**, or by holding **B**.
+
+New in 1.2, from left to right: typing in the composer without the stylus
+(hold **L**, then press **R**), your own saved commands in QUICK, and the DS
+in Japanese.
+
+<p align="center">
+  <img src="docs/screens/compose-focus.png" width="210" alt="The composer with focus on: a key lit on the keyboard, A types it, START sends">
+  &nbsp;
+  <img src="docs/screens/quick-commands.png" width="210" alt="QUICK, COMMANDS: a saved command above the computer's own, and + ADD">
+  &nbsp;
+  <img src="docs/screens/control-ja.png" width="210" alt="The Control screen in Japanese, asking for approval">
 </p>
 
 ## Supported consoles
@@ -331,6 +370,8 @@ anything already on the card, and ejects it when done.
 2. Ask Claude to change a small file. When it asks to edit, the DS turns
    yellow: **"Claude needs your OK: A yes X no"**. Press **A**.
 3. Press **X** to get back to the Control screen from anywhere.
+4. Hold **SELECT**, then press **START**: the controls guide shows what every
+   button does.
 
 [docs/USING.md](docs/USING.md) is the tour of everything else. To update,
 install from source, or uninstall, see
@@ -396,6 +437,7 @@ wsl -d Ubuntu -- bash -lc "dsterm doctor"
 | `dsterm install-service --cwd ~/projects/app` | Start Claude Code in a project instead of your home folder |
 | `dsterm card PATH --rom dsterm.nds --wifi --pair` | Set up an SD card from the computer: the app, Wi-Fi and a pairing |
 | `dsterm card PATH --sounds FOLDER` | Copy your own sounds to the card; `dsterm sounds` lists the names |
+| `dsterm lang --template > fr.lang` | Start an interface language of your own; `dsterm card PATH --lang fr.lang` copies it to the card |
 | `dsterm wsl-setup` | Let the DS through Windows' firewall (Windows only) |
 
 ## Under the hood
@@ -427,7 +469,7 @@ Two programs and the protocol between them, built for a 2004 handheld with a
 
 | Guide | For |
 |---|---|
-| [Using it](docs/USING.md) | Every screen and button, approvals, QUICK, REMOTE, the camera, `dsterm view` |
+| [Using it](docs/USING.md) | Every screen and button, approvals, QUICK, voice, REMOTE, the camera, `dsterm view` |
 | [Your console](docs/HARDWARE.md) | Each DS model, the SD card, and the network |
 | [Customizing](docs/CUSTOMIZING.md) | Your own sounds, buttons, snippets and settings, and changing the code |
 | [Updating, from source, uninstalling](docs/GETTING_STARTED.md) | Everything after the first setup |

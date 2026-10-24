@@ -30,6 +30,12 @@ from __future__ import annotations
 _FULL = [0x3F] * 8
 _UPPER_HALF = [0x3F] * 4 + [0x00] * 4
 _LOWER_HALF = [0x00] * 4 + [0x3F] * 4
+_LOWER_1_8 = [0x00] * 7 + [0x3F] * 1
+_LOWER_2_8 = [0x00] * 6 + [0x3F] * 2
+_LOWER_3_8 = [0x00] * 5 + [0x3F] * 3
+_LOWER_5_8 = [0x00] * 3 + [0x3F] * 5
+_LOWER_6_8 = [0x00] * 2 + [0x3F] * 6
+_LOWER_7_8 = [0x00] * 1 + [0x3F] * 7
 _LEFT_HALF = [0x38] * 8
 _RIGHT_HALF = [0x07] * 8
 _LIGHT_SHADE = [0x15, 0x00, 0x2A, 0x00] * 2
@@ -149,6 +155,14 @@ EXTENDED: list[tuple[int, tuple]] = [
     (0x276E, ("copy", ord("<"))),
     (0x203A, ("copy", ord(">"))),
     (0x2039, ("copy", ord("<"))),
+
+    # --- vertical sparkline bars (1/8 .. 7/8; 4/8 and 8/8 are above) ---
+    (0x2581, ("bits", _LOWER_1_8)),
+    (0x2582, ("bits", _LOWER_2_8)),
+    (0x2583, ("bits", _LOWER_3_8)),
+    (0x2585, ("bits", _LOWER_5_8)),
+    (0x2586, ("bits", _LOWER_6_8)),
+    (0x2587, ("bits", _LOWER_7_8)),
 ]
 
 WIRE_BASE = 0x80

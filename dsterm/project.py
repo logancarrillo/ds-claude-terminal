@@ -20,17 +20,34 @@ Three properties are load-bearing and none of them is an accident:
 
 The card renders whatever it is sent, so every string that leaves here is
 already clipped to the widths in ``protocol.py``.
+
+Beyond git, the WATCH and HEALTH tabs read two files the person writes in the
+project's ``.dsterm/`` (``timer.json`` from ``dsterm timer``, ``watch.json``
+by hand), the load average and the disk's free space. One source is off by
+default because it is not local: GitHub Actions runs come from ``gh run
+list``, a network call every 30 s, only under ``dsterm serve --project-ci``.
+
+A card from before "project64" (1.0.x) refuses a snapshot of more than 48
+rows and draws the glyph bytes as '?'; ``encode`` gives it the rows that
+matter most, folded to ASCII (``fold_ascii``).
 """
 
 from __future__ import annotations
 
+import json
+import math
+import os
+import shutil
 import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Sequence
 
 from . import actions as dsactions
 from . import protocol
+from .extmap import TO_WIRE
 
 # Long enough for a cold cache on a large repository, short enough that a
 # wedged git cannot stall the frame loop it is polled from.
@@ -45,12 +62,59 @@ POLL_INTERVAL_S = 3.0
 # rest of the answer is the summary line above them.
 _DIFF_FILES_MAX = 12
 
+# The WATCH tab's budgets: at most this many rows from watch.json, this many
+# rows in the tab altogether (timer, watch.json and CI), and this many of the
+# latest GitHub Actions runs asked for under --project-ci.
+_WATCH_FILE_ROWS_MAX = 12
+_WATCH_ROWS_MAX = 14
+_CI_RUNS = 4
+
 # Palette indices, mirrored from render.h. Named here so the wording and the
 # colour of a row are decided in the same place.
 _PLAIN = 0
 _RED = 2
 _GREEN = 3
+_YELLOW = 4
+_CYAN = 7
 _ORANGE = 9
+
+_SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: Sequence[float], width: int = 12) -> str:
+    """Render a sequence of numeric readings as an 8-level block sparkline."""
+    if not values or width <= 0:
+        return ""
+    tail = [float(v) for v in values[-width:]]
+    # A NaN or an infinity has no height; drawing one anyway would be a bar
+    # that says something the reading did not. The caller drops the row.
+    if not all(math.isfinite(v) for v in tail):
+        raise ValueError("a sparkline reading is not a finite number")
+    lo, hi = min(tail), max(tail)
+    span = hi - lo
+    out: list[str] = []
+    for v in tail:
+        if span <= 1e-9:
+            idx = 3
+        else:
+            idx = int(round(((v - lo) / span) * 7))
+            idx = max(0, min(7, idx))
+        out.append(_SPARK_BARS[idx])
+    return "".join(out)
+
+
+def progress_bar(pct: float, width: int = 10) -> str:
+    """Render a 0..100 percentage as a block progress bar (`█` and `░`)."""
+    if width <= 0:
+        return ""
+    value = float(pct)
+    # min/max pass a NaN straight through as "100%": refused instead.
+    if not math.isfinite(value):
+        raise ValueError("a progress value is not a finite number")
+    clamped = max(0.0, min(100.0, value))
+    filled = int(round((clamped / 100.0) * width))
+    filled = max(0, min(width, filled))
+    return ("█" * filled) + ("░" * (width - filled))
 
 
 @dataclass(slots=True)
@@ -130,14 +194,212 @@ def _ago(committed_at: int, now: float) -> str:
 
 
 def _clip(text: str, limit: int) -> str:
-    """Printable ASCII, clipped. The encoder enforces both; doing it here too
-    means the value the page shows is the value this module decided on, rather
-    than whatever survived a truncation it could not see."""
-    safe = "".join(c if 0x20 <= ord(c) <= 0x7E else "?" for c in text)
+    """Printable ASCII or extended DS glyph, clipped. The encoder enforces
+    both; doing it here too means the value the page shows is the value this
+    module decided on, rather than whatever survived a truncation it could not
+    see."""
+    safe = "".join(
+        c if (0x20 <= ord(c) <= 0x7E or ord(c) in TO_WIRE) else "?"
+        for c in text
+    )
     return safe[:limit]
 
 
-def collect(cwd: str, quiet_s: int | None = None) -> tuple[Row, ...]:
+_COLOR_MAP = {
+    "default": _PLAIN,
+    "plain": _PLAIN,
+    "red": _RED,
+    "green": _GREEN,
+    "yellow": _YELLOW,
+    "cyan": _CYAN,
+    "orange": _ORANGE,
+}
+
+# Slow 30s caches so collect() is fast and deterministic across adjacent polls.
+_CI_CACHE: dict[str, tuple[float, list[Row]]] = {}
+_HEALTH_CACHE: dict[str, tuple[float, list[Row]]] = {}
+_LOAD_HISTORY: list[float] = []
+_SLOW_CACHE_SECONDS = 30.0
+
+
+def _watch_row(entry: object, l_max: int, v_max: int) -> Row | None:
+    """One watch.json entry as a row, or None when it is not one. Raises on a
+    value of the wrong type; the caller skips that entry and keeps the rest."""
+    if not isinstance(entry, dict):
+        return None
+    lbl = _clip(str(entry.get("label", "")).strip(), l_max)
+    if not lbl:
+        return None
+    val = str(entry.get("value", "")).strip()
+    if "spark" in entry and isinstance(entry["spark"], list):
+        sp = sparkline(entry["spark"], width=10)
+        val = f"{sp} {val}".strip()
+    elif "progress" in entry:
+        pb = progress_bar(float(entry["progress"]), width=8)
+        val = f"{pb} {val}".strip()
+    fg_raw = entry.get("fg", entry.get("color", "plain"))
+    fg = (fg_raw if isinstance(fg_raw, int) and not isinstance(fg_raw, bool)
+          and 0 <= fg_raw <= 15
+          else _COLOR_MAP.get(str(fg_raw).lower(), _PLAIN))
+    return Row(protocol.PROJECT_TAB_WATCH, lbl, _clip(val, v_max), fg)
+
+
+def _collect_watch(cwd: str, ci: bool = False) -> list[Row]:
+    """Rows for the WATCH tab: Pomodoro timer, declarative .dsterm/watch.json,
+    and -- with ``ci`` (``--project-ci``) only -- GitHub Actions runs when the
+    origin is on github.com and `gh` is installed."""
+    watch = protocol.PROJECT_TAB_WATCH
+    l_max = protocol.PROJECT_LABEL_MAX
+    v_max = protocol.PROJECT_VALUE_MAX
+    rows: list[Row] = []
+
+    # 1. Pomodoro / focus timer (.dsterm/timer.json)
+    timer_path = Path(cwd) / ".dsterm" / "timer.json"
+    if timer_path.is_file():
+        try:
+            data = json.loads(timer_path.read_text(encoding="utf-8"))
+            # Valid JSON that is not an object ([], null, "x") is as bad a
+            # file as a truncated one: no row, never an exception that would
+            # take the whole page down with it.
+            if not isinstance(data, dict):
+                raise ValueError("timer.json is not an object")
+            end_ts = float(data.get("end_ts", 0))
+            duration_s = max(60.0, float(data.get("duration_s", 1500)))
+            label = str(data.get("label", "focus"))[:l_max] or "focus"
+            rem = end_ts - time.time()
+            if rem <= 0:
+                rows.append(Row(watch, _clip(label, l_max),
+                                _clip(f"{progress_bar(100, 8)} done!", v_max), _GREEN))
+            else:
+                mins_left = int((rem + 59) // 60)
+                pct = 100.0 * (1.0 - (rem / duration_s))
+                bar = progress_bar(pct, 8)
+                rows.append(Row(watch, _clip(label, l_max),
+                                _clip(f"{bar} ~{mins_left}m left", v_max), _ORANGE))
+        except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+            # One bad file costs its own row, never the page: an end_ts of
+            # 1e400 is an infinity, and int() of one raises OverflowError.
+            pass
+
+    # 2. Declarative watch rows (.dsterm/watch.json)
+    watch_file = Path(cwd) / ".dsterm" / "watch.json"
+    if watch_file.is_file():
+        try:
+            raw = json.loads(watch_file.read_text(encoding="utf-8"))
+            items = raw.get("rows", raw) if isinstance(raw, dict) else raw
+            if isinstance(items, list):
+                for entry in items[:_WATCH_FILE_ROWS_MAX]:
+                    # Per entry: one bad "spark" or "progress" (a string, a
+                    # NaN, an infinity) costs that row, not the whole file.
+                    try:
+                        row = _watch_row(entry, l_max, v_max)
+                    except (ValueError, TypeError, OverflowError):
+                        continue
+                    if row is not None:
+                        rows.append(row)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+    # 3. GitHub Actions CI status: opt-in (--project-ci), because `gh run
+    # list` asks GitHub over the network, every 30 s while a card is
+    # connected. Cached 30 s, and only with a github.com origin.
+    if not ci:
+        return rows[:_WATCH_ROWS_MAX]
+    now = time.monotonic()
+    cached = _CI_CACHE.get(cwd)
+    if cached is not None and now - cached[0] < _SLOW_CACHE_SECONDS:
+        rows.extend(cached[1])
+    else:
+        ci_rows: list[Row] = []
+        remote_url = _git(cwd, "config", "--get", "remote.origin.url")
+        gh = shutil.which("gh") if remote_url else None
+        if gh and remote_url and "github.com" in remote_url:
+            try:
+                out = subprocess.run(
+                    [gh, "run", "list", "--limit", str(_CI_RUNS),
+                     "--json", "name,status,conclusion,headBranch"],
+                    cwd=cwd, capture_output=True, text=True, timeout=2.5, check=False,
+                )
+                if out.returncode == 0 and out.stdout.strip():
+                    runs = json.loads(out.stdout)
+                    # gh answers with a list of objects; anything else (an
+                    # object, a null, a list of strings) is no rows, not an
+                    # exception that freezes the page.
+                    if not isinstance(runs, list):
+                        runs = []
+                    for r in runs[:_CI_RUNS]:
+                        if not isinstance(r, dict):
+                            continue
+                        status = str(r.get("status", ""))
+                        conc = str(r.get("conclusion", ""))
+                        wf = str(r.get("name", "ci"))[:l_max] or "ci"
+                        br = str(r.get("headBranch", ""))
+                        if status != "completed":
+                            mark, fg = "●", _YELLOW
+                            state_word = status or "running"
+                        elif conc == "success":
+                            mark, fg = "✓", _GREEN
+                            state_word = "pass"
+                        else:
+                            mark, fg = "✗", _RED
+                            state_word = conc or "fail"
+                        ci_rows.append(Row(
+                            watch,
+                            _clip(wf, l_max),
+                            _clip(f"{mark} {state_word} ({br})", v_max),
+                            fg,
+                        ))
+            except (OSError, subprocess.SubprocessError, ValueError,
+                    TypeError, AttributeError):
+                pass
+        _CI_CACHE[cwd] = (now, ci_rows)
+        rows.extend(ci_rows)
+
+    return rows[:_WATCH_ROWS_MAX]
+
+
+def _collect_health(cwd: str) -> list[Row]:
+    """Rows for the HEALTH tab (cached 30s so adjacent polls stay identical)."""
+    now = time.monotonic()
+    cached = _HEALTH_CACHE.get(cwd)
+    if cached is not None and now - cached[0] < _SLOW_CACHE_SECONDS:
+        return list(cached[1])
+
+    health = protocol.PROJECT_TAB_HEALTH
+    v_max = protocol.PROJECT_VALUE_MAX
+    rows: list[Row] = []
+
+    try:
+        load1, _, _ = os.getloadavg()
+        cpus = os.cpu_count() or 1
+        pct = min(100.0, (load1 / cpus) * 100.0)
+        _LOAD_HISTORY.append(load1)
+        if len(_LOAD_HISTORY) > 12:
+            del _LOAD_HISTORY[:-12]
+        sp = sparkline(_LOAD_HISTORY, width=8)
+        fg = _RED if pct >= 85.0 else (_ORANGE if pct >= 60.0 else _GREEN)
+        rows.append(Row(health, "server cpu",
+                        _clip(f"{sp} {load1:.1f} ({cpus}c)", v_max), fg))
+    except (AttributeError, OSError):
+        pass
+
+    try:
+        usage = shutil.disk_usage(cwd)
+        used_pct = (usage.used / usage.total) * 100.0 if usage.total else 0.0
+        free_gb = usage.free // (1024 ** 3)
+        bar = progress_bar(used_pct, width=8)
+        fg = _RED if used_pct >= 90.0 else _GREEN
+        rows.append(Row(health, "server disk",
+                        _clip(f"{bar} {free_gb}G free", v_max), fg))
+    except OSError:
+        pass
+
+    _HEALTH_CACHE[cwd] = (now, rows)
+    return list(rows)
+
+
+def collect(cwd: str, quiet_s: int | None = None,
+            ci: bool = False) -> tuple[Row, ...]:
     """Every row of one snapshot, or () when there is nothing honest to say."""
     toplevel = _git(cwd, "rev-parse", "--show-toplevel")
     if not toplevel:
@@ -267,6 +529,22 @@ def collect(cwd: str, quiet_s: int | None = None) -> tuple[Row, ...]:
                 rows.append(Row(diff, "and",
                                 f"{len(entries) - _DIFF_FILES_MAX} more"))
 
+    # WATCH: Pomodoro timer, declarative .dsterm/watch.json, and CI runs.
+    rows.extend(_collect_watch(toplevel, ci))
+
+    # HEALTH: server CPU load sparkline and disk headroom.
+    rows.extend(_collect_health(toplevel))
+
+    # LOG: recent commit history on the repository.
+    recent_log = _git(cwd, "log", "-6", "--pretty=%h %s")
+    if recent_log:
+        for line in recent_log.splitlines()[:6]:
+            sha, _, subj = line.partition(" ")
+            if sha and subj:
+                rows.append(Row(protocol.PROJECT_TAB_LOG,
+                                _clip(sha, protocol.PROJECT_LABEL_MAX),
+                                _clip(subj, v_max), _PLAIN))
+
     return tuple(rows[:protocol.PROJECT_ROWS_MAX])
 
 
@@ -322,8 +600,11 @@ class BackgroundCollector:
       length of one snapshot.
     """
 
-    def __init__(self, cwd: str, interval: float = POLL_INTERVAL_S) -> None:
+    def __init__(self, cwd: str, interval: float = POLL_INTERVAL_S,
+                 ci: bool = False) -> None:
         self._cwd = cwd
+        # --project-ci: whether WATCH may ask GitHub (see _collect_watch).
+        self._ci = ci
         self._interval = interval
         self._lock = threading.Lock()
         self._rows: tuple[Row, ...] = ()
@@ -395,7 +676,7 @@ class BackgroundCollector:
         try:
             # Resolved here rather than captured in __init__ so that patching
             # the module function is honoured -- and so a future caller can.
-            rows: tuple[Row, ...] | None = collect(self._cwd, quiet_s)
+            rows: tuple[Row, ...] | None = collect(self._cwd, quiet_s, self._ci)
         except Exception:
             # The page keeps its last honest answer, and the next tick tries
             # again. A collector that dies on one bad git is a page that goes
@@ -408,16 +689,79 @@ class BackgroundCollector:
                 self._result = rows
 
 
-def encode(rows: tuple[Row, ...]) -> list[bytes]:
+# The DS glyphs as the ASCII a 1.0.x card can draw. The sparkline's eight
+# levels stay eight distinct, rising characters; a bar is '#' on '.'.
+_ASCII_FOLD = {
+    "─": "-", "━": "-", "═": "-",
+    "│": "|", "┃": "|", "║": "|",
+    "┌": "+", "┐": "+", "└": "+", "┘": "+", "├": "+", "┤": "+",
+    "┬": "+", "┴": "+", "┼": "+", "╭": "+", "╮": "+", "╯": "+", "╰": "+",
+    "▁": "_", "▂": ".", "▃": ",", "▄": "-", "▅": "=", "▆": "+", "▇": "*",
+    "█": "#", "▀": "#", "▌": "#", "▐": "#",
+    "░": ".", "▒": ":", "▓": "%",
+    "▖": "#", "▗": "#", "▘": "#", "▙": "#", "▚": "#", "▛": "#", "▜": "#",
+    "▝": "#", "▞": "#", "▟": "#",
+    "\u00a0": " ", "●": "*", "○": "o", "•": "*", "▪": "*", "·": ".",
+    "…": "...", "✓": "+", "✗": "x", "✘": "x", "⏸": "||", "✻": "*",
+    "✨": "*", "←": "<-", "→": "->", "↑": "^", "↓": "v",
+    "❯": ">", "›": ">", "❮": "<", "‹": "<",
+}
+
+
+def fold_ascii(text: str) -> str:
+    """``text`` in printable ASCII: each DS glyph folded to its stand-in
+    above, anything else non-printable '?'."""
+    return "".join(
+        ch if 0x20 <= ord(ch) <= 0x7E else _ASCII_FOLD.get(ch, "?")
+        for ch in text
+    )
+
+
+# Which rows a 1.0.x card keeps when the snapshot is over its 48: NOW, DIFF
+# and DO are the page it was built for, then WATCH, HEALTH and LOG -- the
+# newer tabs -- in that order, row by row until there are 48: a tab that does
+# not fit whole keeps its first rows, and the tabs after it keep none.
+_V1_PRIORITY = (
+    (protocol.PROJECT_TAB_NOW, protocol.PROJECT_TAB_DIFF, protocol.PROJECT_TAB_DO),
+    (protocol.PROJECT_TAB_WATCH,),
+    (protocol.PROJECT_TAB_HEALTH,),
+    (protocol.PROJECT_TAB_LOG,),
+)
+
+
+def _for_v1(rows: tuple[Row, ...]) -> tuple[Row, ...]:
+    """At most PROJECT_ROWS_MAX_V1 rows, the most important kept, in their
+    original order; every string folded to ASCII and re-clipped."""
+    limit = protocol.PROJECT_ROWS_MAX_V1
+    keep: set[int] = set()
+    for tabs in _V1_PRIORITY:
+        for i, r in enumerate(rows):
+            if r.tab in tabs and len(keep) < limit:
+                keep.add(i)
+    return tuple(
+        Row(r.tab, fold_ascii(r.label)[:protocol.PROJECT_LABEL_MAX] or "?",
+            fold_ascii(r.value)[:protocol.PROJECT_VALUE_MAX], r.fg)
+        for i, r in enumerate(rows) if i in keep
+    )
+
+
+def encode(rows: tuple[Row, ...], project64: bool = True) -> list[bytes]:
     """The snapshot as wire frames, one row each.
 
     An empty snapshot is one explicit empty message rather than no messages,
     because the card distinguishes "nothing to report" from "never told".
+
+    ``project64=False`` is for a card that did not announce "project64": it
+    gets ``_for_v1``'s rows, at most 48 and ASCII only, which is everything it
+    accepts.
     """
+    if not project64:
+        rows = _for_v1(rows)
     if not rows:
         return [protocol.encode_project_empty()]
     count = len(rows)
     return [
-        protocol.encode_project_row(i, count, r.tab, r.fg, r.label, r.value)
+        protocol.encode_project_row(i, count, r.tab, r.fg, r.label, r.value,
+                                    project64=project64)
         for i, r in enumerate(rows)
     ]

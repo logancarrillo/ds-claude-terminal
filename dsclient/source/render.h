@@ -61,6 +61,12 @@ void render_grid(const grid_t *g);
 void render_glyph_into(uint16_t *target, int stride, int px, int py,
                        uint8_t glyph, uint16_t fgc, uint16_t bgc);
 
+// Paint one Unicode codepoint into an arbitrary 16-bit surface using font6x8
+// for ASCII and ui_font.h for Latin-1 accents, Kana, and CJK ideographs.
+// Returns the drawn width in pixels (6 for narrow, 12 for wide CJK/Kana).
+int render_unicode_into(uint16_t *target, int stride, int px, int py,
+                        uint32_t cp, uint16_t fgc, uint16_t bgc);
+
 // Paint one cell into an arbitrary 16-bit surface, so the sub screen's bitmap
 // background reuses the glyph loop above rather than duplicating it.
 //
@@ -116,6 +122,12 @@ void render_overlay_list(const char *title, const char * const *rows,
 // cells.  See project.h for why the PROJECT page is a grid rather than a
 // bespoke layout.  Close it with render_overlay_close() like any other.
 void render_overlay_grid(const grid_t *g);
+
+// A box with an accent border and `count` lines of UI-font text, `pitch`
+// pixels apart, each in its own colour, over the overlay already up.  Drawn
+// only if it fits the screen.
+void render_overlay_box(int x, int y, int w, int h, const char *const *lines,
+                        const uint16_t *colours, int count, int pitch);
 
 void render_overlay_close(const grid_t *g);
 int render_overlay_active(void);

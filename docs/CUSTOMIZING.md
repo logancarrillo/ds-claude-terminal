@@ -1,20 +1,25 @@
 # Customizing
 
 Most of what you might want to change needs no compiler. The quickest is on
-the DS itself: **SETTINGS**, then the **CUSTOMIZE** tab (tap it, or press L or
-R). Sounds,
-buttons, snippets and server options are files. The rest is a small,
+the DS itself: **SETTINGS**, then the **SOUND**, **SCREEN** or **LINK** tab
+(tap one, or press L or R). Sounds, buttons, snippets, interface languages and
+server options are files. The rest is a small,
 well-tested C codebase, and the second half of this page walks through the
 common changes.
 
 | You want to | Do this | Rebuild? |
 |---|---|---|
-| Change sound, volume, typing clicks, writing sounds, accent colour, start screen, autoconnect, the picture size | The DS's **SETTINGS → CUSTOMIZE** ([USING.md](USING.md#settings)) | No |
+| Change sound, volume, typing clicks, writing sounds | The DS's **SETTINGS → SOUND** ([USING.md](USING.md#settings)) | No |
+| Change the accent colour, interface language, start screen, or hide addresses | The DS's **SETTINGS → SCREEN** | No |
+| Change autoconnect, view taps, the picture size, the live view, the microphone mode | The DS's **SETTINGS → LINK** | No |
 | Remap A, B, X, Y and START, or pick the camera's shutter | The DS's **SETTINGS → BUTTONS** | No |
 | Use your own sounds | Put WAV files in `/dsterm/sounds/` on the SD card | No |
+| Add an interface language | `dsterm lang --template > fr.lang`, translate the right-hand sides, then `dsterm card PATH --lang fr.lang` | No |
+| Save your own quick commands | On the DS: **QUICK → COMMANDS → + ADD** ([USING.md](USING.md#quick)) | No |
 | Add buttons for your commands | Write a `buttons` file on the computer | No |
 | Keep canned prompts | Write a `snippets` file | No |
 | Change server options | Write `~/.config/ds-claude-terminal/serve.conf` | No |
+| Set up speech-to-text | Install a local Whisper, or set `DSTERM_STT_...` ([below](#speech-to-text)) | No |
 | Change what a Control tile does | Edit two `switch` statements | Yes (the ROM) |
 | Change the built-in sound set | Replace WAVs and run one script | Yes (the ROM) |
 
@@ -55,7 +60,7 @@ STATUS) says which file and why. The DS keeps them uncompressed, and all of
 them together may use a megabyte: about 30 seconds of sound at 16 kHz, or
 12 at 44.1 kHz. 16 or 22 kHz is plenty for a DS speaker.
 
-Your sounds play when **SOUND** is set to **SOFT** (Settings, CUSTOMIZE).
+Your sounds play when **SOUND** is set to **SOFT** (SETTINGS → SOUND).
 CHIP, the default, is the square-wave voice and has no samples. Like the built-in ones, each plays as recorded
 or a whole tone higher or lower, so a sound with a strong pitch will be heard
 in three keys.
@@ -169,6 +174,9 @@ dsterm restart
 | `--no-camera-popup` | The camera's live view stops popping up in other attached terminals; `dsterm camera` still shows it |
 | `--photo-dir PATH` | Where sent pictures are saved, instead of `.dsterm/photos/` in the project on screen |
 | `--photo-keep N` | How many pictures the folder keeps (default 20; nothing older than a week is kept either way) |
+| `--no-mic` | Turns off push-to-talk: the DS is never told a microphone is available, and nothing voice-related crosses |
+| `--stt-cloud` | Lets push-to-talk use a cloud speech-to-text service (OpenAI, Groq or `DSTERM_STT_URL`) when no local one is installed. Off by default: without it a recording never leaves this computer, whatever API keys are set ([USING.md](USING.md#voice-push-to-talk)) |
+| `--project-ci` | Shows GitHub Actions runs on PROJECT → WATCH, read with `gh run list` every 30 seconds. Off by default because it is a network call |
 | `--no-keep-awake` | Lets the computer idle to sleep even while a DS is connected (by default a Mac or Linux computer stays awake until the last DS leaves; on WSL, Windows decides) |
 | `--fps N` | How often the screen is checked for changes (default 15) |
 | `--port`, `--discovery-port`, `--dashboard-port` | The TCP, UDP and dashboard ports |
@@ -185,6 +193,33 @@ environment plus two optional files, both readable only by you (mode 600):
 ```
 
 If Claude Code is already logged in, you need neither.
+
+### Speech-to-text
+
+Push-to-talk ([USING.md](USING.md#voice-push-to-talk)) uses one backend,
+chosen when the server starts: a local one if any is installed, otherwise a
+cloud one only if you opted in. The variables go in the `env` file above and
+take effect on `dsterm restart`:
+
+| Variable | Does |
+|---|---|
+| `DSTERM_STT_CMD` | Your own program, run as `program WAV LANG`; what it prints is the transcript. Wins over everything else |
+| `DSTERM_STT_MODEL` | The model: a name for the Python libraries (`base` by default) or the cloud services, or the path of a `ggml-*.bin` file for whisper.cpp |
+| `DSTERM_STT_TIMEOUT` | Seconds a recording may take, 5 to 17 (default 15) |
+| `DSTERM_STT_URL` | A cloud service of your own; must be `https://` |
+| `DSTERM_STT_KEY` | The key sent to `DSTERM_STT_URL`, and only there |
+| `OPENAI_API_KEY`, `GROQ_API_KEY` | The cloud services used with `--stt-cloud` when no `DSTERM_STT_URL` is set (in that order) |
+
+And in `serve.conf`:
+
+| Option | Does |
+|---|---|
+| `--stt-cloud` | Allows the cloud backends at all. Without it a recording never leaves this computer, whatever keys are set. (`DSTERM_STT_CLOUD=1` in the server's own environment does the same; in the `env` file it does nothing) |
+| `--no-mic` | Turns push-to-talk off |
+| `--project-ci` | Not voice, but also off unless added: GitHub Actions runs on PROJECT → WATCH |
+
+`dsterm serve` prints where recordings go at every start (`dsterm logs`
+shows it), for example `voice: transcribed on this computer (faster-whisper)`.
 
 ### A bigger grid
 

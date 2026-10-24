@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "ext.h"
+#include "lang.h"
 #include "log.h"
 #include "sound.h"
 
@@ -96,6 +97,15 @@ static void show_familiar(void)
     familiar_until = frame + CHIME_FAMILIAR_FRAMES;
 }
 
+// Characters typed on the session's input line since the last Enter (or
+// Ctrl-C), as far as this card's own keys can tell. Saturates; a Backspace
+// takes one away. A lone Escape and most escape sequences are not text --
+// but Up and Down recall history into the line, so after one the line is
+// treated as holding something (it usually does; an empty recall costs one
+// SENT cue). LF is not a reset either: in Claude Code it is a newline
+// inside the prompt, not a submit, and a composer body may end in one.
+static unsigned line_typed;
+
 void chime_init(void)
 {
     state = CHIME_IDLE;
@@ -117,6 +127,36 @@ void chime_init(void)
     waiting_since = 0;
     reminded = 0;
     state_quiet_until = 0;
+    line_typed = 0;
+}
+
+int chime_typed(const char *bytes, size_t n)
+{
+    if (!bytes || n == 0) return 0;
+    if (n == 1 && bytes[0] == '\r') {
+        const int submits = line_typed > 0 || chime_needs_you();
+        line_typed = 0;
+        return submits;
+    }
+    if ((unsigned char)bytes[0] == 0x1b) {
+        // ESC [ A / ESC [ B, or the application-mode ESC O A / ESC O B.
+        if (n == 3 && (bytes[1] == '[' || bytes[1] == 'O') &&
+            (bytes[2] == 'A' || bytes[2] == 'B') && line_typed == 0) {
+            line_typed = 1;
+        }
+        return 0;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const unsigned char b = (unsigned char)bytes[i];
+        if (b == 0x7f || b == 0x08) {
+            if (line_typed) line_typed--;
+        } else if (b == 0x03 || b == '\r') {
+            line_typed = 0;
+        } else if (b >= 0x20 && line_typed < 0xFFFFu) {
+            line_typed++;
+        }
+    }
+    return 0;
 }
 
 void chime_sent(void)
@@ -442,6 +482,8 @@ unsigned chime_claude(void)
 
 void chime_claude_reset(void)
 {
+    // A new connection's input line is not one this card typed on.
+    line_typed = 0;
     claude_state = 0;
     reminded = 0;
 }
@@ -452,34 +494,62 @@ int chime_needs_you(void)
 }
 
 // The approval headline, from the buttons that answer it (Settings'
-// BUTTONS tab).  Built when they change, so the headline is a plain read.
-static char answer_line[48] = "Claude needs your OK:  A yes   X no";
+// BUTTONS tab).  Built when they change, and again only when the language it
+// was built in is no longer the one on screen -- so the headline is a plain
+// read, and the line is never rebuilt from its own buffers: the button names
+// are kept in buffers of their own, and snprintf never reads the string it is
+// writing (overlapping source and destination is undefined behaviour).
+// Room for a translation in three-byte CJK characters, not just English.
+static char answer_line[128] = "Claude needs your OK:  A yes   X no";
+static char answer_yes[16] = "A";
+static char answer_no[16] = "X";
+static unsigned answer_lang = LANG_EN;
+
+static void answer_line_build(void)
+{
+    answer_lang = lang_current();
+    if (answer_no[0]) {
+        snprintf(answer_line, sizeof(answer_line),
+                 "%s:  %s %s   %s %s", tr(TR_CHIME_APPROVAL),
+                 answer_yes, tr(TR_CHIME_YES), answer_no, tr(TR_CHIME_NO));
+    } else {
+        snprintf(answer_line, sizeof(answer_line),
+                 "%s:  %s %s", tr(TR_CHIME_APPROVAL), answer_yes,
+                 tr(TR_CHIME_YES));
+    }
+}
 
 void chime_set_answer_buttons(const char *yes, const char *no)
 {
     if (!yes || !yes[0]) yes = "A";
-    if (no && no[0]) {
-        snprintf(answer_line, sizeof(answer_line),
-                 "Claude needs your OK:  %s yes   %s no", yes, no);
-    } else {
-        snprintf(answer_line, sizeof(answer_line),
-                 "Claude needs your OK:  %s yes", yes);
-    }
+    if (!no) no = "";
+    // Callers pass button_name()'s literals; a caller passing these very
+    // buffers back would be a no-op, so it is one rather than an overlap.
+    if (yes != answer_yes) snprintf(answer_yes, sizeof(answer_yes), "%s", yes);
+    if (no != answer_no) snprintf(answer_no, sizeof(answer_no), "%s", no);
+    answer_line_build();
 }
 
+// One path for every language.  Each state's line is a translation key whose
+// English is the line this headline has always shown, so English is the same
+// bytes it was, and a language that has no string for a state -- a custom
+// pack that skipped it -- falls back to that English line rather than to a
+// different state's wording.
 const char *chime_headline(void)
 {
     switch (claude_state) {
-    case 3: return answer_line;
-    case 4: return "Claude asked you something";
-    case 2: return "Claude is working";
+    case 3:
+        if (answer_lang != lang_current()) answer_line_build();
+        return answer_line;
+    case 4: return tr(TR_CHIME_QUESTION);
+    case 2: return tr(TR_CHIME_WORKING);
     default: break;
     }
     if (lantern_active && frame - lantern_frame < CHIME_LANTERN_FRAMES) {
-        return "Another session has new output";
+        return tr(TR_CHIME_LANTERN);
     }
-    if (state == CHIME_SENT || state == CHIME_WAITING) return "Sent -- waiting for Claude";
-    if (state == CHIME_STREAMING) return "Claude is answering";
-    if (claude_state == 1) return settled ? "Done -- your turn" : "Ready";
-    return settled ? "Answer ready" : "Ready";
+    if (state == CHIME_SENT || state == CHIME_WAITING) return tr(TR_CHIME_SENT);
+    if (state == CHIME_STREAMING) return tr(TR_CHIME_ANSWERING);
+    if (claude_state == 1) return settled ? tr(TR_CHIME_DONE) : tr(TR_CHIME_IDLE);
+    return settled ? tr(TR_CHIME_ANSWERED) : tr(TR_CHIME_IDLE);
 }

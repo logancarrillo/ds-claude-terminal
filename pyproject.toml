@@ -16,7 +16,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ds-claude-terminal"
-version = "1.0.1"
+version = "1.2"
 description = "Claude Code on a Nintendo DS: the server half"
 readme = "README.md"
 license = { text = "MIT" }

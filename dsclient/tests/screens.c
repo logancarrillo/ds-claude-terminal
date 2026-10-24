@@ -21,10 +21,13 @@
 #include "../source/profiles.h"
 #include "../source/project.h"
 #include "../source/focus.h"
+#include "../source/guide.h"
 #include "../source/kbd.h"
+#include "../source/lang.h"
 #include "../source/log.h"
 #include "../source/mirror.h"
 #include "../source/proto.h"
+#include "../source/quick.h"
 #include "../source/remote.h"
 #include "../source/privacy.h"
 #include "../source/render.h"
@@ -79,6 +82,10 @@ static void fill_terminal(int asking)
     }
 }
 
+// Language shots are for looking at, not for the docs: written next to the
+// rest but listed on stderr, so tools/screenshots.sh does not publish them.
+static int shots_quiet;
+
 static void write_ppm(const char *name)
 {
     // Top screen, a 16-pixel hinge, bottom screen; every pixel doubled.
@@ -105,7 +112,7 @@ static void write_ppm(const char *name)
         }
     }
     fclose(f);
-    printf("%s\n", path);
+    fprintf(shots_quiet ? stderr : stdout, "%s\n", path);
 
     // And the bottom screen as `dsterm view` receives it (mirror.c), so the
     // text the computer shows can be held up against the pixels.
@@ -127,6 +134,70 @@ static void connected_status(void)
 {
     status_link_host("MacBook");
     status_link_set(14, 1, 13, 1, 0, 1, 201, 1, 0);
+}
+
+// The controls guide, as main.c paints it: the still session with the
+// pop-up over it on top, the drawn console below.  `keys` is a sequence of
+// held key words fed to guide_step() one frame each -- the real decision,
+// order rules and all -- and the last word is what is drawn lit.
+static void guide_shot(const char *name, console_family_t family,
+                       guide_ctx_t ctx, const guide_config_t *cfg,
+                       const unsigned *keys, unsigned nkeys)
+{
+    static guide_t g;
+    static grid_t session;
+    guide_init(&g, ctx, cfg);
+    unsigned prev = 0, held = 0;
+    for (unsigned i = 0; i < nkeys; i++) {
+        held = keys[i];
+        (void)guide_step(&g, cfg, held, held & ~prev);
+        prev = held;
+    }
+    guide_session_fill(&session);
+    render_overlay_grid(&session);
+    if (g.shown) {
+        static char lines[GUIDE_POPUP_LINES][GUIDE_LINE_MAX];
+        const unsigned n = guide_popup_lines(&g.entry, lines);
+        const char *rows[GUIDE_POPUP_LINES];
+        for (unsigned i = 0; i < GUIDE_POPUP_LINES; i++) rows[i] = lines[i];
+        const uint16_t colours[GUIDE_POPUP_LINES] = {
+            render_palette_rgb(PAL_ORANGE), render_palette_rgb(PAL_WHITE),
+            render_palette_rgb(PAL_DEFAULT), render_palette_rgb(PAL_DEFAULT),
+        };
+        int x, y, w, h;
+        guide_popup_rect(n, &x, &y, &w, &h);
+        render_overlay_box(x, y, w, h, rows, colours, (int)n, GUIDE_POPUP_PITCH);
+    }
+    subscreen_set_guide(1, &g, cfg, family, held);
+    bottom();
+    write_ppm(name);
+    subscreen_set_guide(0, NULL, NULL, CONSOLE_UNKNOWN, 0);
+    bottom();
+}
+
+// One shot per context in the language on screen, each with a combo of that
+// context pressed and lit.
+static void guide_context_shots(const char *lang, const guide_config_t *cfg)
+{
+    static const struct { guide_ctx_t ctx; const char *tag; unsigned keys[24]; unsigned n; } SHOTS[] = {
+        // CONTROL: L, then R joins -- the focus chord.
+        { GUIDE_CTX_CONTROL, "control", { 0x200, 0x300 }, 2 },
+        // KEYS: R (Shift), then Y: Shift-Tab.
+        { GUIDE_CTX_KEYS, "keys", { 0x100, 0, 0x800 }, 3 },
+        // COMPOSE: R first, then L, nothing recording: the order notice.
+        { GUIDE_CTX_COMPOSE, "compose", { 0x100, 0x300 }, 2 },
+        // FOCUS: START sends.
+        { GUIDE_CTX_FOCUS, "focus", { 0x008 }, 1 },
+        // CAMERA: the shutter (R) pressed.
+        { GUIDE_CTX_CAMERA, "camera", { 0x100 }, 1 },
+        // QUICK: Y, forget.
+        { GUIDE_CTX_QUICK, "quick", { 0x800 }, 1 },
+    };
+    for (unsigned i = 0; i < sizeof(SHOTS) / sizeof(SHOTS[0]); i++) {
+        char name[64];
+        snprintf(name, sizeof(name), "guide-%s-%s", lang, SHOTS[i].tag);
+        guide_shot(name, CONSOLE_DSI, SHOTS[i].ctx, cfg, SHOTS[i].keys, SHOTS[i].n);
+    }
 }
 
 int main(void)
@@ -197,12 +268,11 @@ int main(void)
     bottom();
     write_ppm("settings");
 
-    // 4b. Settings, BUTTONS: Y remapped to Space, scrolled to the bottom so
-    // SHUTTER, the fixed buttons and the arrow show.
+    // 4b. Settings, BUTTONS: Y remapped to Space, SHUTTER and DEFAULTS on the
+    // same screen without scrolling.
     st.buttons.action[BUTTON_Y] = BUTTON_SPACE;
     settings_ui_tab(&st, &ui, SETTINGS_TAB_BUTTONS);
     ui.row = SETTINGS_ROW_SHUTTER;
-    for (int i = 0; i < 8; i++) settings_ui_move(&st, &ui, 0, 1);
     settings_render(&st, &ui, &about, &page);
     render_overlay_grid(&page);
     subscreen_set_settings(&st, &ui);
@@ -341,6 +411,19 @@ int main(void)
     subscreen_set_composer(1);
     bottom();
     write_ppm("compose");
+
+    // 8b. Composer with focus on its keyboard (L first, then R): a key lit,
+    // and the top screen saying what A, B, START and X do now. A look, not a
+    // doc picture, so it is listed on stderr.
+    render_overlay_text("COMPOSE -- LOCAL, NOTHING SENT YET",
+                        "Add a test for the empty string case\n"
+                        "and run the suite.",
+                        "FOCUS  A TYPE  B DEL  START SEND  X OUT");
+    focus_on(FOCUS_KEYS);
+    focus_move(3, 1);
+    bottom();
+    write_ppm("compose-focus");
+    focus_off();
     subscreen_set_composer(0);
 
     // 9. PROJECT: the DO tab, with the built-in buttons and one of yours.
@@ -389,5 +472,186 @@ int main(void)
         subscreen_set_boot_body(NULL);
         subscreen_set_boot(0, 0, NULL, NULL);
     }
+
+    // 11b. For the docs: the controls guide on a DSi, in COMPOSE, with L
+    // held and then R -- the focus chord the composer otherwise hides -- and
+    // QUICK's COMMANDS with a saved command above + ADD.
+    lang_set_current(LANG_EN);
+    {
+        static button_map_t dmap;
+        button_map_defaults(&dmap);
+        guide_config_t dcfg = { &dmap, SHUTTER_R, 0, 1, 1 };
+        static const unsigned l_then_r[] = { 0x200, 0x300 };
+        guide_shot("controls-guide", CONSOLE_DSI, GUIDE_CTX_COMPOSE, &dcfg,
+                   l_then_r, 2);
+        render_overlay_close(&term);
+
+        static quick_commands_t dqc;
+        static quick_recent_t dqr;
+        static quick_saved_t dqs;
+        quick_commands_init(&dqc);
+        const char theirs[] = "/deploy\n/release-notes";
+        (void)quick_commands_apply(&dqc, (const uint8_t *)theirs, sizeof(theirs) - 1);
+        quick_recent_init(&dqr);
+        quick_saved_init(&dqs);
+        (void)quick_saved_add(&dqs, "run the tests and fix what fails");
+        subscreen_set_quick_saved(&dqs, 0);
+        fill_terminal(0);
+        render_grid(&term);
+        status_mode_set(SCREEN_MODE_CONTROL);
+        subscreen_set_quick(1, SUBSCREEN_QUICK_COMMANDS,
+                            (int)quick_commands_total(&dqc, &dqs) - 1, 0, &dqc, &dqr);
+        bottom();
+        write_ppm("quick-commands");
+        subscreen_set_quick(0, SUBSCREEN_QUICK_MAIN, 0, 0, NULL, NULL);
+        subscreen_set_quick_saved(NULL, 0);
+        bottom();
+    }
+
+    // 12. The controls guide: every console, every context, a pop-up, a
+    // remapped A, and (in the loop below) every language.  Quiet: these are
+    // to look at, not doc pictures.
+    shots_quiet = 1;
+    lang_set_current(LANG_EN);
+    {
+        static button_map_t gmap;
+        button_map_defaults(&gmap);
+        guide_config_t gcfg = { &gmap, SHUTTER_R, 0, 1, 1 };
+        static const unsigned none[] = { 0 };
+        guide_shot("guide-intro", CONSOLE_DSI, GUIDE_CTX_CONTROL, &gcfg, none, 0);
+        static const unsigned hold_a[] = { 0x001 };
+        guide_shot("guide-ds", CONSOLE_DS, GUIDE_CTX_CONTROL, &gcfg, hold_a, 1);
+        guide_shot("guide-dslite", CONSOLE_DS_LITE, GUIDE_CTX_CONTROL, &gcfg, hold_a, 1);
+        guide_shot("guide-dsi", CONSOLE_DSI, GUIDE_CTX_CONTROL, &gcfg, hold_a, 1);
+        static const unsigned hold_down[] = { 0x080 };
+        guide_shot("guide-3ds", CONSOLE_3DS, GUIDE_CTX_CONTROL, &gcfg, hold_down, 1);
+        guide_shot("guide-unknown", CONSOLE_UNKNOWN, GUIDE_CTX_KEYS, &gcfg, hold_a, 1);
+        // A remapped to Space: the label and the pop-up follow the map.
+        gmap.action[BUTTON_A] = BUTTON_SPACE;
+        gmap.action[BUTTON_B] = BUTTON_ENTER;
+        guide_shot("guide-remap", CONSOLE_DS_LITE, GUIDE_CTX_CONTROL, &gcfg, hold_a, 1);
+        button_map_defaults(&gmap);
+        // Holding R in COMPOSE: talk; then L in LATCH mode.
+        static unsigned hold_r[12];
+        for (unsigned i = 0; i < 8; i++) hold_r[i] = 0x100;
+        hold_r[8] = 0x300;
+        gcfg.latch = 1;
+        guide_shot("guide-compose-latch", CONSOLE_3DS, GUIDE_CTX_COMPOSE, &gcfg, hold_r, 9);
+        gcfg.latch = 0;
+        guide_shot("guide-compose-talk", CONSOLE_DS, GUIDE_CTX_COMPOSE, &gcfg, hold_r, 8);
+        // A card without a camera: no CAMERA tab.
+        gcfg.camera = 0;
+        static const unsigned sel[] = { 0x004 };
+        guide_shot("guide-nocamera", CONSOLE_DS_LITE, GUIDE_CTX_CONTROL, &gcfg, sel, 1);
+        gcfg.camera = 1;
+        guide_context_shots("en", &gcfg);
+    }
+    render_overlay_close(&term);
+
+    // The composer's new hint rows, in English, with speech-to-text offered.
+    render_overlay_text("COMPOSE -- LOCAL, NOTHING SENT YET",
+                        "Add a test for the empty string case",
+                        "A SEND  B DEL  Y SNIPPETS  X CANCEL");
+    subscreen_set_composer(1);
+    subscreen_set_voice(1, 0, 0, 0);
+    bottom();
+    write_ppm("lang-en-compose");
+    subscreen_set_voice(0, 0, 0, 0);
+    subscreen_set_composer(0);
+    render_overlay_close(&term);
+    shots_quiet = 0;
+
+    // 11. Every built-in language: the screens with the most words on them,
+    // to look at before a translation or a layout change ships.
+    shots_quiet = 1;
+    for (unsigned l = 1; l < LANG_BUILTIN_COUNT; l++) {
+        char name[64];
+        lang_set_current(l);
+        st.language = (int)l;
+        chime_set_answer_buttons("A", "X");
+        {
+            button_map_t bm;
+            char legend[128];
+            button_map_defaults(&bm);
+            button_map_legend(&bm, legend, sizeof(legend));
+            subscreen_set_button_legend(legend, "A", "START", "Y");
+        }
+
+        fill_terminal(1);
+        render_grid(&term);
+        chime_claude_state(2);
+        chime_claude_state(3);
+        status_mode_set(SCREEN_MODE_CONTROL);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-control", lang_code(l));
+        write_ppm(name);
+        // One language for the docs: Japanese, the one furthest from the
+        // English pictures, so the README can show the DS speaking it.
+        if (l == LANG_JA) {
+            shots_quiet = 0;
+            write_ppm("control-ja");
+            shots_quiet = 1;
+        }
+        chime_claude_state(1);
+
+        for (unsigned t = 0; t < SETTINGS_TAB_COUNT; t++) {
+            settings_ui_tab(&st, &ui, t);
+            settings_render(&st, &ui, &about, &page);
+            render_overlay_grid(&page);
+            subscreen_set_settings(&st, &ui);
+            status_mode_set(SCREEN_MODE_SETTINGS);
+            bottom();
+            snprintf(name, sizeof(name), "lang-%s-settings-%u", lang_code(l), t);
+            write_ppm(name);
+        }
+
+        static quick_commands_t qc;
+        static quick_recent_t qr;
+        static quick_saved_t qs;
+        quick_commands_init(&qc);
+        quick_recent_init(&qr);
+        quick_saved_init(&qs);
+        (void)quick_saved_add(&qs, "run the tests and fix what fails");
+        subscreen_set_quick_saved(&qs, 0);
+        status_mode_set(SCREEN_MODE_CONTROL);
+        subscreen_set_quick(1, SUBSCREEN_QUICK_MAIN, 0, 0, &qc, &qr);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-quick", lang_code(l));
+        write_ppm(name);
+        subscreen_set_quick(1, SUBSCREEN_QUICK_COMMANDS, 0, 0, &qc, &qr);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-commands", lang_code(l));
+        write_ppm(name);
+        // The last row, + ADD, highlighted: a tall label on the bar.
+        subscreen_set_quick(1, SUBSCREEN_QUICK_COMMANDS,
+                            (int)quick_commands_total(&qc, &qs) - 1, 0, &qc, &qr);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-commands-add", lang_code(l));
+        write_ppm(name);
+        subscreen_set_quick(1, SUBSCREEN_QUICK_AGAIN, 0, 0, &qc, &qr);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-again", lang_code(l));
+        write_ppm(name);
+        subscreen_set_quick(0, SUBSCREEN_QUICK_MAIN, 0, 0, NULL, NULL);
+        subscreen_set_quick_saved(NULL, 0);
+
+        {
+            static button_map_t gmap;
+            button_map_defaults(&gmap);
+            guide_config_t gcfg = { &gmap, SHUTTER_R, 0, 1, 1 };
+            guide_context_shots(lang_code(l), &gcfg);
+            render_overlay_close(&term);
+        }
+        render_overlay_text("COMPOSE", "...", "A SEND");
+        subscreen_set_composer(1);
+        subscreen_set_voice(1, 0, 0, 0);
+        bottom();
+        snprintf(name, sizeof(name), "lang-%s-compose", lang_code(l));
+        write_ppm(name);
+        subscreen_set_voice(0, 0, 0, 0);
+        subscreen_set_composer(0);
+        render_overlay_close(&term);
+    }
+    lang_set_current(LANG_EN);
     return 0;
 }

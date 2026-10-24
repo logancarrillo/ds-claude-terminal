@@ -73,6 +73,10 @@ int host_link_up(void);
 // so and reconnects, and returns 0.
 int host_send_camera(const uint8_t *frame, size_t n, unsigned long *tx);
 
+// One whole voice frame (VOICE_START, VOICE_CHUNK or VOICE_END), sealed and
+// sent.  Any other type is refused.
+int host_send_voice(const uint8_t *frame, size_t n, unsigned long *tx);
+
 // The session list the server last advertised.  Read-only.
 const sessions_t *host_sessions(void);
 

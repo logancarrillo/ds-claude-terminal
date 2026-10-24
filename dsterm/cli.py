@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import filecmp
 import getpass
+import json
+import math
 import os
 import platform as _platform
 import shutil
@@ -856,6 +858,7 @@ def cmd_card(argv: list[str]) -> int:
     want_wifi = want_pair = False
     host_override: str | None = None
     sounds_dir: str | None = None
+    lang_files: list[str] = []
     args = list(argv)
     while args:
         a = args.pop(0)
@@ -879,6 +882,10 @@ def cmd_card(argv: list[str]) -> int:
             if not args:
                 die("--sounds needs a folder of WAV files")
             sounds_dir = args.pop(0)
+        elif a == "--lang":
+            if not args:
+                die("--lang needs a .lang file")
+            lang_files.append(args.pop(0))
         elif a.startswith("-"):
             if not any(e.card_option(a, card) for e in exts):
                 die(f"unknown option '{a}' -- try: dsterm --help")
@@ -907,7 +914,7 @@ def cmd_card(argv: list[str]) -> int:
                 die(f"no ROM at {rom}")
         else:
             repo = card.repo
-            if repo is None and (want_wifi or want_pair or sounds_dir):
+            if repo is None and (want_wifi or want_pair or sounds_dir or lang_files):
                 # Settings or sounds alone: the ROM already on the card stays.
                 note("no --rom given: the app already on the card is left as it is")
                 card.rom = False
@@ -963,6 +970,16 @@ def cmd_card(argv: list[str]) -> int:
     sound_plan: list[Path] = []
     sound_aside: list[Path] = []
     sounds_target = root / "sounds"
+    lang_plan: list[Path] = []
+    for lf in lang_files:
+        lp = Path(lf).expanduser()
+        if not lp.is_file():
+            die(f"no language file at {lf}")
+        size = lp.stat().st_size
+        if size > LANG_FILE_MAX:
+            die(f"{lf} is {size} bytes, and the DS reads at most 8 KB of a "
+                f".lang file ({LANG_FILE_MAX} bytes): it would refuse this one")
+        lang_plan.append(lp)
     if sounds_dir is not None:
         from . import sounds
 
@@ -1064,6 +1081,23 @@ def cmd_card(argv: list[str]) -> int:
         write_verified(wifi_file, wifi_plan, "wifi.cfg")
         print("Wi-Fi settings written to dsterm/wifi.cfg (DHCP)")
 
+    if lang_plan:
+        lang_dir = root / "lang"
+        lang_dir.mkdir(parents=True, exist_ok=True)
+        for src in lang_plan:
+            name = src.name if src.name.endswith(".lang") else f"{src.stem}.lang"
+            copy_verified(src, lang_dir / name.lower(), name)
+        print(f"lang: {len(lang_plan)} copied to dsterm/lang/, verified; "
+              "pick it under SETTINGS -> SCREEN -> LANGUAGE on the DS")
+        # Counted on the card, after the copy: files already there take
+        # slots too, and the DS loads the first LANG_CUSTOM_MAX it finds.
+        on_card = sorted(p.name for p in lang_dir.iterdir()
+                         if p.is_file() and p.name.lower().endswith(".lang"))
+        if len(on_card) > LANG_CUSTOM_MAX:
+            note(f"dsterm/lang/ holds {len(on_card)} .lang files, and the DS "
+                 f"loads at most {LANG_CUSTOM_MAX} (the first it finds); "
+                 "remove the ones you do not use: " + ", ".join(on_card))
+
     if pair_plan is not None:
         device_id, host, key, path, name = pair_plan
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1108,6 +1142,202 @@ def cmd_sounds(argv: list[str]) -> int:
     from . import sounds
 
     print(sounds.usage())
+    return 0
+
+
+# The ROM's limits on a custom language (LANG_FILE_MAX and LANG_CUSTOM_MAX in
+# dsclient/source/lang.h): a .lang file over 8 KB is refused whole, and only
+# the first two .lang files in dsterm/lang/ are loaded.
+LANG_FILE_MAX = 8192
+LANG_CUSTOM_MAX = 2
+
+LANG_TEMPLATE = """\
+# DS Claude Terminal custom UI language pack
+# Copy to /dsterm/lang/<code>.lang on the SD card (or run: dsterm card PATH --lang FILE.lang)
+# Any key left out, or misspelled, shows in English: translate as much or as
+# little as you like. The guide's longer explanations (guide.do.*) are left
+# to English here. At most 8 KB; %s is filled in by the DS, keep it.
+code = fr
+label = FR
+name = Français
+
+control.keys = CLAVIER
+control.keys.sub = en direct
+control.quick = RAPIDE
+control.quick.sub = mode, annuler
+control.photo = PHOTO
+control.photo.sub = montrer
+control.again = REFAIRE
+control.again.sub = récents
+control.compose = RÉDIGER
+control.compose.sub = écrire d'abord
+control.remote = DISTANT
+control.remote.sub = sessions
+control.settings = RÉGLAGES
+control.settings.sub = son, modèle
+control.relink = RELIER
+control.hint.scroll = haut/bas défile  maintenir bas: direct
+control.hint.focus = croix déplace  A ouvre  B retour
+compose.head = RÉDIGER: rien n'est envoyé avant d'appuyer sur A
+compose.keys = A envoie   B efface   X annule
+compose.focus.head = FOCUS: la croix choisit, A écrit
+compose.focus.keys = START envoie  B efface  X sort du focus
+compose.mic.idle = R / TOUCHER: maintenir pour dicter (voix)
+compose.mic.rec = ÉCOUTE... relâcher R pour transcrire
+compose.mic.latch = ENREGISTREMENT -- R ou L arrête
+compose.mic.wait = Transcription vocale sur le serveur...
+keys.floor.0 = Chaque touche va directement à Claude.
+keys.floor.1 = SHFT: abc ABC !@#   X: retour
+quick.head = RAPIDE   HAUT/BAS choisir   A faire   X retour
+quick.sub = COMMANDS et AGAIN ouvrent l'éditeur
+remote.head = DISTANT   HAUT/BAS choisir   A ouvrir   X retour
+project.hint = toucher un onglet   X RETOUR
+project.do.safe = toucher charge; A envoie
+project.do.god = MODE DIEU: toucher exécute immédiatement
+status.paste = CHARGER DANS L'ÉDITEUR
+status.nopaste = RIEN À COLLER
+chime.idle = Claude est prêt
+chime.working = Claude travaille...
+chime.approval = Claude attend votre accord
+chime.question = Claude pose une question
+
+guide.title = COMMANDES
+guide.intro = touchez un bouton ou un combo; rien n'est envoyé
+guide.press = appuyez sur un bouton
+guide.tabs.hint = GAUCHE/DROITE onglets
+guide.foot = sortir: B maintenu, FINI ou SELECT+START
+guide.done = FINI
+guide.tab.control = CONTRÔLE
+guide.tab.keys = TOUCHES
+guide.tab.compose = RÉDIGER
+guide.tab.focus = FOCUS
+guide.tab.camera = CAMÉRA
+guide.tab.quick = RAPIDE
+guide.combo.lr = L puis R
+guide.combo.rl = R puis L
+guide.combo.holdr = maintenir R
+guide.combo.rthen = R, puis %s
+guide.combo.dpad = croix
+guide.name.screens = ÉCRANS
+guide.name.scroll = DÉFILER
+guide.name.arrows = FLÈCHES
+guide.name.ctrl = CTRL
+guide.name.shift = MAJ
+guide.name.mode = MODE
+guide.name.focus = FOCUS
+guide.name.back = RETOUR
+guide.name.send = ENVOYER
+guide.name.delete = EFFACER
+guide.name.cancel = ANNULER
+guide.name.snippets = EXTRAITS
+guide.name.nothing = INUTILISÉ
+guide.name.talk = PARLER
+guide.name.latch = VERROU
+guide.name.order = PAS FOCUS
+guide.name.type = ÉCRIRE
+guide.name.move = BOUGER
+guide.name.shutter = PHOTO
+guide.name.flip = INVERSER
+guide.name.open = OUVRIR
+guide.name.forget = OUBLIER
+guide.name.close = FERMER
+"""
+
+
+def cmd_lang(argv: list[str]) -> int:
+    for a in argv:
+        if a != "--template":
+            die(f"unknown argument '{a}' -- usage: dsterm lang [--template]")
+    if argv:
+        print(LANG_TEMPLATE, end="")
+        return 0
+    # The ROM's list (dsclient/source/lang.h).
+    print("Built-in UI languages on the DS (SETTINGS -> SCREEN -> LANGUAGE):")
+    print("  en   EN   English (default)")
+    print("  es   ES   Español")
+    print("  zh   ZH   中文 (Simplified Chinese)")
+    print("  ja   JA   日本語")
+    print()
+    print("Import any custom language:")
+    print("  dsterm lang --template > fr.lang")
+    print("  dsterm card /Volumes/SDCARD --lang fr.lang")
+    return 0
+
+
+# Written beside timer.json the first time `dsterm timer` creates it, so the
+# file the timer leaves in somebody's repository is ignored by git rather than
+# showing up as untracked. It names only itself and the timer: a watch.json
+# the person wrote, or anything else in .dsterm/, is theirs to commit or not.
+TIMER_GITIGNORE = "# written by `dsterm timer`\n/.gitignore\n/timer.json\n"
+
+
+def cmd_timer(argv: list[str]) -> int:
+    """A focus timer on PROJECT -> WATCH: .dsterm/timer.json at the top of
+    the repository (where the server's PROJECT page reads it), or in the
+    current directory outside one."""
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=3,
+                             check=False).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        top = ""
+    timer_file = Path(top or Path.cwd()) / ".dsterm" / "timer.json"
+    if not argv or argv[0] == "status":
+        if not timer_file.is_file():
+            print("timer: off (start with: dsterm timer 25)")
+            return 0
+        try:
+            data = json.loads(timer_file.read_text(encoding="utf-8"))
+            # Valid JSON of another shape ([], null) is as unreadable as a
+            # torn file; so is an end_ts of NaN, or of 1e400 (an infinity,
+            # which int() refuses with OverflowError).
+            if not isinstance(data, dict):
+                raise ValueError("not an object")
+            label = str(data.get("label", "focus")) or "focus"
+            left = float(data.get("end_ts", 0)) - time.time()
+            if left != left:
+                raise ValueError("end_ts is not a number")
+            if left <= 0:
+                print(f"timer: {label} -- done")
+            else:
+                # Rounded up: "0m 00s remaining" is a timer that is done.
+                rem = math.ceil(left)
+                print(f"timer: {label} -- {rem // 60}m {rem % 60:02d}s remaining")
+        except (OSError, ValueError, TypeError, OverflowError):
+            print("timer: off")
+        return 0
+    if argv[0] in ("stop", "clear", "off"):
+        try:
+            timer_file.unlink()
+        except FileNotFoundError:
+            pass
+        print("timer: stopped")
+        return 0
+    try:
+        minutes = float(argv[0])
+    except ValueError:
+        die("usage: dsterm timer [MINUTES [LABEL] | stop | status]")
+    # Written as the message says it: 1 to 240, and a NaN (which compares
+    # false to everything) is refused by the same test.
+    if not 1 <= minutes <= 240:
+        die("timer minutes must be between 1 and 240")
+    # The rest of the line is the label: `dsterm timer 25 deep work` is
+    # "deep work", not "deep".
+    label = " ".join(argv[1:]).strip() or "focus"
+    timer_file.parent.mkdir(parents=True, exist_ok=True)
+    ignore = timer_file.parent / ".gitignore"
+    if not ignore.exists():
+        ignore.write_text(TIMER_GITIGNORE, encoding="utf-8")
+    duration_s = minutes * 60.0
+    payload = {
+        "label": label[:12],
+        "duration_s": duration_s,
+        "end_ts": time.time() + duration_s,
+    }
+    timer_file.write_text(json.dumps(payload), encoding="utf-8")
+    print(f"timer: started {minutes:g}m ({label[:12]}) -- shown on PROJECT -> WATCH")
+    print(f"  (kept in {timer_file}; git ignores it through .dsterm/.gitignore "
+          "unless that file was already yours)")
     return 0
 
 
@@ -1318,6 +1548,9 @@ dsterm -- the DS Claude Terminal server
   wsl-setup                  Windows firewall / port proxy for WSL2
   card PATH [opts]           write the ROM (and optionally settings) to an SD card
   sounds                     the cue names for your own sounds, and the format
+  lang [--template]          built-in UI languages, and a template to import your own
+  timer [MIN [LABEL] | stop | status]
+                             a Pomodoro focus timer on PROJECT -> WATCH
   install-service [--cwd P]  the service only
   build [make args]          build the ROM (checkout only)
   test                       the Python and C suites (checkout only)
@@ -1329,6 +1562,7 @@ card options:
   --host ADDR    the address the card should use for this PC (with --pair)
   --rom FILE     write this ROM instead of building one
   --sounds DIR   check and copy your own sounds (`dsterm sounds` lists the names)
+  --lang FILE    copy a custom .lang UI translation file to dsterm/lang/
   --no-eject     leave the card mounted
 """
 
@@ -1350,6 +1584,8 @@ COMMANDS: dict[str, Callable[[list[str]], int]] = {
     "wsl-setup": cmd_wsl_setup,
     "card": cmd_card,
     "sounds": cmd_sounds,
+    "lang": cmd_lang,
+    "timer": cmd_timer,
     "install-service": cmd_install_service,
     "build": cmd_build,
     "test": cmd_test,

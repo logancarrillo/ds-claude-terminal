@@ -20,6 +20,7 @@
 #include "sessions.h"   // bounded, formatting-safe MSG_SESSIONS state
 #include "remote.h"     // the same, for MSG_REMOTE
 #include "snippets.h"   // the pushed-snippet limits are snippets.c's rules
+#include "voice.h"      // the microphone's formats, chunk size and limits
 
 // The grid geometry is a build-time decision that must match the server's
 // DSTERM_COLS/DSTERM_ROWS EXACTLY: a mismatch is an out-of-bounds write on a
@@ -59,7 +60,13 @@
 // grid of the wrong shape.
 #define PROTO_STR_(x) #x
 #define PROTO_STR(x) PROTO_STR_(x)
-#define PROTO_HELLO_CAPS "ds-term/1 mode snippets project clip remote state seal seal3 commands mirror ask " \
+//
+// `project64` says this card takes up to PROTO_PROJECT_ROWS_MAX (64) PROJECT
+// rows and draws the 0x80..0xBF glyphs (blocks, sparklines) in them.  A
+// server sends more than 48 rows, or any of those bytes, only to a card that
+// said it; an older ROM gets the old page.  The glyph bytes are display only
+// on this card: project_action_keyable() keeps them off the wire.
+#define PROTO_HELLO_CAPS "ds-term/1 mode snippets project clip remote state seal seal3 commands mirror ask mic project64 " \
                          "grid=" PROTO_STR(PROTO_COLS) "x" PROTO_STR(PROTO_ROWS)
 #define PROTO_HELLO_CAPS_LEN (sizeof(PROTO_HELLO_CAPS) - 1)
 // A DSi-mode card adds " camera" to the core tokens: it is the gate for every
@@ -109,7 +116,7 @@
 // this protocol that names a command.
 #define PROTO_PROJECT_EMPTY_SIZE 1
 #define PROTO_PROJECT_CHUNK_SIZE 6
-#define PROTO_PROJECT_ROWS_MAX 48
+#define PROTO_PROJECT_ROWS_MAX 64
 
 // MSG_CLIP carries the desktop's clipboard down, chunked on the same
 // discipline for the same MSS reason.  The fixed part is count, index, seq,
@@ -194,6 +201,14 @@ typedef enum {
     // never answer the next.  Sent only after a MSG_STATE carrying an ask id
     // has arrived on this connection, which is the proof the server knows it.
     MSG_ANSWER        = 0x21,
+    // Push-to-Talk microphone (voice.h): audio samples and a language hint.
+    // None names a file, a path or a command; the server transcribes the
+    // utterance and returns MSG_VOICE_TEXT, which lands only in the local
+    // composer for a second deliberate press of A.  Sent only after
+    // MSG_MIC_READY has arrived on this connection.
+    MSG_VOICE_START   = 0x22,   // u8 format (1=IMA ADPCM 8kHz), u8 lang_len, lang
+    MSG_VOICE_CHUNK   = 0x23,   // u32be offset, 1..480 ADPCM bytes
+    MSG_VOICE_END     = 0x24,   // u32be total_bytes, u32be crc32
 
     MSG_NONCE      = 0x81,
     MSG_AUTH_OK    = 0x82,
@@ -260,6 +275,10 @@ typedef enum {
     // card acts on only with SETTINGS -> VIEW TAPS on.
     MSG_MIRROR       = 0xA7,    // u8 flags: bit0 a view is watching
     MSG_TOUCH        = 0xA8,    // u8 x (0..255), u8 y (0..191)
+    // The microphone's answers, sent only to a card that announced "mic".
+    MSG_MIC_READY    = 0xA9,    // u8 flags: bit0 speech-to-text is available
+    MSG_VOICE_ACK    = 0xAA,    // u32be received ADPCM bytes (credit window)
+    MSG_VOICE_TEXT   = 0xAB,    // u8 status, u16be len, printable ASCII + LF for composer
     MSG_ERROR      = 0xFF
 } msg_type_t;
 
@@ -558,5 +577,32 @@ size_t proto_encode_empty(uint8_t *out, msg_type_t type);
 // PHOTO_END and PHOTO_DISCARD.  The PHOTO screen sends these and nothing
 // else (host_send_camera in main.c refuses the rest), so it cannot type.
 int proto_camera_type(uint8_t type);
+
+// ----------------------------------------------------------------- voice ---
+//
+// Mirrors the voice section of dsterm/protocol.py byte for byte.  Gated by
+// the "mic" HELLO token and MSG_MIC_READY.
+
+#define PROTO_MIC_CAN_TRANSCRIBE 0x01
+
+typedef struct {
+    uint8_t status;
+    uint16_t text_len;
+    char text[VOICE_TEXT_MAX + 1];
+} voice_text_t;
+
+size_t proto_encode_voice_start(uint8_t *out, uint8_t format, const char *lang);
+size_t proto_encode_voice_chunk(uint8_t *out, uint32_t offset,
+                                const uint8_t *data, uint16_t len);
+size_t proto_encode_voice_end(uint8_t *out, uint32_t total, uint32_t crc);
+
+proto_result_t proto_decode_mic_ready(int *can_transcribe_out,
+                                      const uint8_t *payload, uint16_t len);
+proto_result_t proto_decode_voice_ack(uint32_t *acked_out,
+                                      const uint8_t *payload, uint16_t len);
+proto_result_t proto_decode_voice_text(voice_text_t *out,
+                                       const uint8_t *payload, uint16_t len);
+
+int proto_voice_type(uint8_t type);
 
 #endif  // DSTERM_PROTO_H

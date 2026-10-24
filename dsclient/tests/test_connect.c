@@ -625,7 +625,7 @@ static void test_profiles_find_moved(void)
     profiles_t p;
     memset(&p, 0, sizeof(p));
     p.count = 2;
-    snprintf(p.servers[0].name, sizeof(p.servers[0].name), "MacBookPro");
+    snprintf(p.servers[0].name, sizeof(p.servers[0].name), "StudyPC");
     snprintf(p.servers[0].host, sizeof(p.servers[0].host), "192.168.0.30");
     p.servers[0].port = 8347;
     snprintf(p.servers[1].name, sizeof(p.servers[1].name), "192.168.0.20");
@@ -633,22 +633,22 @@ static void test_profiles_find_moved(void)
     p.servers[1].port = 8347;
 
     // The router moved it: same name (any case), same port, a new address.
-    CHECK(profiles_find_moved(&p, "macbookpro", "192.168.0.31", 8347) == 0,
+    CHECK(profiles_find_moved(&p, "studypc", "192.168.0.31", 8347) == 0,
           "a saved computer at a new address was not recognised");
     // Where it is saved, it has not moved.
-    CHECK(profiles_find_moved(&p, "MacBookPro", "192.168.0.30", 8347) == -1,
+    CHECK(profiles_find_moved(&p, "StudyPC", "192.168.0.30", 8347) == -1,
           "a computer at its saved address counted as moved");
     // Another port is another server.
-    CHECK(profiles_find_moved(&p, "MacBookPro", "192.168.0.31", 9000) == -1,
+    CHECK(profiles_find_moved(&p, "StudyPC", "192.168.0.31", 9000) == -1,
           "a different port counted as the same server");
     // An address something else is saved at is not up for grabs.
-    CHECK(profiles_find_moved(&p, "MacBookPro", "192.168.0.20", 8347) == -1,
+    CHECK(profiles_find_moved(&p, "StudyPC", "192.168.0.20", 8347) == -1,
           "a saved computer's address was taken for a moved one");
     CHECK(profiles_find_moved(&p, "", "192.168.0.31", 8347) == -1 &&
               profiles_find_moved(&p, "Other", "192.168.0.31", 8347) == -1,
           "a computer with no or another name counted as moved");
 
-    CHECK(profile_name_is_address("192.168.0.20") && !profile_name_is_address("MacBookPro") &&
+    CHECK(profile_name_is_address("192.168.0.20") && !profile_name_is_address("StudyPC") &&
               !profile_name_is_address("") && !profile_name_is_address("DESKTOP-ABC1234"),
           "address-like names are not told apart from hostnames");
 }

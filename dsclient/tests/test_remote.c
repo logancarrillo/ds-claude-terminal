@@ -384,6 +384,7 @@ static void test_every_handled_type_passes_the_reader(void)
         MSG_SNIPPETS, MSG_EXTENSION, MSG_PROJECT, MSG_CLIP, MSG_PAIR_REPLY,
         MSG_PAIR_OK, MSG_PAIR_FAIL, MSG_REMOTE, MSG_REMOTE_NOTE, MSG_STATE,
         MSG_CAMERA_READY, MSG_CAMERA_ACK, MSG_PHOTO_SAVED,
+        MSG_MIC_READY, MSG_VOICE_ACK, MSG_VOICE_TEXT,
         MSG_ERROR,
     };
     for (unsigned i = 0; i < sizeof(TYPES) / sizeof(TYPES[0]); i++) {
@@ -413,7 +414,7 @@ static void test_remote_computer_rows_fit_names_and_say_moved(void)
     snprintf(c.items[0].host, sizeof(c.items[0].host), "192.168.0.20");
     c.items[0].current = 1;
     c.items[0].saved = 1;
-    snprintf(c.items[1].name, sizeof(c.items[1].name), "MacBookPro");
+    snprintf(c.items[1].name, sizeof(c.items[1].name), "StudyPC");
     snprintf(c.items[1].host, sizeof(c.items[1].host), "192.168.0.31");
     snprintf(c.items[1].old_host, sizeof(c.items[1].old_host), "192.168.0.30");
     c.items[1].saved = 1;

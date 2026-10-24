@@ -154,7 +154,7 @@ against a stand-in libnds, by the screenshot harness; `main.c`, `boot.c` and
 | `kbd.c` | Touch keyboard (10x5, three layers, one-shot Ctrl and Shift, key repeat), the Control screen's tile rectangles, and the key word built from `REG_KEYINPUT` plus libnds's X and Y |
 | `focus.c` | L+R focus mode: the d-pad walks a highlight over tiles or keys. Traversal is derived from `kbd.c`'s rectangles |
 | `status.c` | The bottom-screen mode machine, STATUS tabs, and the link, counter and view-position lines |
-| `settings.c` | SETTINGS: its three tabs (SESSION, CUSTOMIZE, BUTTONS), rows and option chips, scrolling for a tab longer than the screen, the theme colours, the page render, and `/dsterm-settings.cfg` |
+| `settings.c` | SETTINGS: its five tabs (SESSION, SOUND, SCREEN, LINK, BUTTONS), rows and option chips, scrolling for a tab longer than the screen, the theme colours, the page render, and `/dsterm-settings.cfg` |
 | `buttons.c` | What A, B, X, Y and START send (Enter, Space, Delete, Esc, Tab, Stop), the rule that Enter stays on a button, and the legend the Control screen shows |
 | `log.c` | The 24-line log ring the STATUS screen shows |
 | `keys.h` | Key sequences the card sends (Page Up, Page Down) |
@@ -195,12 +195,13 @@ against a stand-in libnds, by the screenshot harness; `main.c`, `boot.c` and
 
 | File | Role |
 |---|---|
-| `cli.py` | The `dsterm` command: `setup`, `pair`, `devices`, `doctor`, `start`/`stop`/`restart`/`status`/`logs`, `serve`, `screen`, `camera`, `view`, `attach`, `wsl-setup`, `card`, `sounds`, `install-service`, `install-card`, `build`, `test`. Defines `CliExtension` |
+| `cli.py` | The `dsterm` command: `setup`, `pair`, `devices`, `doctor`, `start`/`stop`/`restart`/`status`/`logs`, `serve`, `screen`, `camera`, `view`, `attach`, `wsl-setup`, `card`, `sounds`, `lang`, `timer`, `install-service`, `install-card`, `build`, `test`. Defines `CliExtension` |
 | `serve.py` | `dsterm serve`: arguments, tmux wrapping (`tmux_command`), the child's API-key and env files, extension loading, the dashboard |
 | `awake.py` | Keeps the computer from idling to sleep while a handheld is connected (`caffeinate` on macOS, `systemd-inhibit` on Linux); `--no-keep-awake` turns it off |
 | `server.py` | The core of the `Server`: the select loop, accept (at most two connections), handshake and takeover, SEAL, dispatching each message, the paced outbox, and the tick that turns the session into frames |
 | `connection.py` | `ClientState`, one card's connection, and the records the outbox carries. The connection's own fields, then one part per feature, which only that feature and the core touch |
 | `server_camera.py` | Photos, the live view, the feed socket and the tmux popups |
+| `server_voice.py` | Push-to-talk: assembling a card's recording, one transcription per card on a worker thread, the watchdog that answers a card whose transcript is late |
 | `server_pairing.py` | The pairing exchange and the per-device key a connection's AUTH is checked against |
 | `server_scrollback.py` | Scrolling back: the view offset, the tmux capture worker, `VIEW_POS` |
 | `server_mirror.py` | `dsterm view`'s glue: `MIRROR`, `TOUCH`, and what the view hub's keys and screens do |
@@ -220,7 +221,7 @@ against a stand-in libnds, by the screenshot harness; `main.c`, `boot.c` and
 | `x25519.py` | X25519 in pure Python |
 | `chacha20.py` | ChaCha20 in pure Python, the card's `chacha20.c` on the server |
 | `discovery.py` | The UDP responder: strict parsing, at most 20 answers a second |
-| `project.py` | Read-only git facts for the PROJECT page, collected on a background thread |
+| `project.py` | Read-only git facts for the PROJECT page, plus WATCH (`dsterm timer`, `.dsterm/watch.json`, GitHub Actions under `--project-ci`), HEALTH and LOG, collected on a background thread; 48 ASCII rows for a card without `project64` |
 | `actions.py` | Discovered DO-tab buttons: your own (`.dsterm-buttons`, `~/.config/ds-claude-terminal/buttons`), package scripts, Makefile targets, Python tests. Names are validated, not quoted |
 | `snippets.py` | Server-pushed snippets, under the same limits the card enforces |
 | `clip.py` | The Windows clipboard via PowerShell under WSL, folded to ASCII. Content a password manager marks as concealed never leaves the process, and the text is never logged. Off unless `--clip` |
@@ -232,6 +233,8 @@ against a stand-in libnds, by the screenshot harness; `main.c`, `boot.c` and
 | `client.py` | The reference client. It does what the DS does, no more; used by the tests and `dsterm screen` |
 | `peek.py` | `dsterm screen`: the screen from the local dashboard, which leaves the DS connected; for another computer, it connects as the DS would |
 | `camera.py` | The camera's computer half: the preview decoder, the planar-420 to RGB and PNG converters, the photo store (`<project>/.dsterm/photos`, symlink-safe), the mode-600 feed socket, the half-block renderer and the tmux popup controller |
+| `voice.py` | The IMA ADPCM codec, the utterance assembler, and speech-to-text: choosing the one backend at startup (local first; cloud only on `--stt-cloud`), running it under a deadline, folding the transcript to ASCII |
+| `stt_worker.py` | A Python Whisper library in a process of its own, so its model stays loaded between recordings and a hung call can be killed |
 | `view.py` | The server's end of `dsterm view`: the mode-600 view socket, both screens out as JSON lines, keys and taps in, every line bounded |
 | `viewer.py` | `dsterm view`: both screens framed like the device, top over bottom, as pictures through the terminal's image protocol where it has one and as text where it does not; the camera's section, clicks on the bottom screen as taps, Ctrl-] for its own keys |
 | `dsscreen.py` | The DS's screens as 256x192 pictures, drawn with the card's own fonts, palette and caret rules; PNG, and the kitty and iTerm2 image protocols |

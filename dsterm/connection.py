@@ -22,6 +22,7 @@ from . import camera as dscamera
 from . import pairing
 from . import remote
 from . import sessions
+from . import voice as dsvoice
 from .protocol import (
     FrameReader,
     Seal,
@@ -137,6 +138,15 @@ class Caps:
     # The camera: HELLO-announced AND offered by this server. Without it no
     # camera message from this connection is legitimate.
     camera: bool = False
+    # Push-to-Talk microphone: HELLO-announced ("mic") AND offered (not
+    # --no-mic). Without it no voice message from this connection is
+    # legitimate, and no MIC_READY is sent.
+    mic: bool = False
+    # "project64": this card takes up to 64 PROJECT rows and the DS glyph
+    # bytes 0x80-0xBF in them. A card without it (1.0.x) refuses a snapshot
+    # of more than 48 rows and draws those bytes as '?', so it is sent at most
+    # 48 rows of printable ASCII (project.encode).
+    project64: bool = False
     # Every token the HELLO carried, for an extension's gate.
     tokens: frozenset[str] = frozenset()
     # What this connection advertised, for the log and the dashboard: a record
@@ -277,6 +287,22 @@ class CameraLink:
     last_preview_stored_at: float = 0.0
 
 
+@dataclass(slots=True)
+class VoiceLink:
+    """This card's microphone upload and transcription state (server_voice.py)."""
+
+    assembler: dsvoice.VoiceAssembler | None = None
+    # One transcription at a time per card: VOICE_END while this is set
+    # answers BUSY.
+    transcribing: bool = False
+    # The job the card is waiting for (0: none). A result carrying any other
+    # number -- abandoned at its deadline, or from before a disconnect -- is
+    # dropped rather than delivered.
+    job: int = 0
+    # time.monotonic() past which the watchdog abandons the job.
+    deadline: float = 0.0
+
+
 # eq=False so identity decides. A dataclass __eq__ would compare every field,
 # which is both wrong and dangerous here: two connections are never the same
 # connection however similar their state, and list.remove() would then be free
@@ -362,3 +388,4 @@ class ClientState:
     scroll: ScrollState = field(default_factory=ScrollState)
     agents: AgentsState = field(default_factory=AgentsState)
     camera: CameraLink = field(default_factory=CameraLink)
+    voice: VoiceLink = field(default_factory=VoiceLink)

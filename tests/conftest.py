@@ -84,3 +84,19 @@ def _no_personal_buttons(monkeypatch, tmp_path_factory):
 
     monkeypatch.setattr(actions, "USER_BUTTONS",
                         tmp_path_factory.mktemp("home") / "buttons")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_speech_to_text(request, monkeypatch):
+    """Servers built by the suite never find this machine's own speech-to-text.
+
+    A developer with mlx-whisper or faster-whisper installed would otherwise
+    have every test Server pick it up, and the suite builds hundreds: one
+    worker process each, every one loading a model, crashed a Mac outright.
+    tests/test_voice.py chooses its backends itself and is left alone."""
+    if request.node.fspath.basename == "test_voice.py":
+        return
+    from dsterm import voice
+
+    monkeypatch.setattr(voice, "choose_backend",
+                        lambda env=None, cloud=False: (None, "off (tests)"))

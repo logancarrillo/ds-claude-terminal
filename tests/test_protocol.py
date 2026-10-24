@@ -522,6 +522,58 @@ class TestNoSideChannels:
         # an "ask" card the server also holds back a plain KEY carrying Enter
         # while a question is open, which again only refuses. STATE's tail is
         # that id and one flag byte, display state like the rest of STATE.
+        #
+        # VOICE_START, VOICE_CHUNK, VOICE_END, MIC_READY, VOICE_ACK and
+        # VOICE_TEXT are the DS's Push-to-Talk microphone, and they are the
+        # first types here that make the server RUN something on the card's
+        # say-so -- so, like the camera, the argument is said in full.
+        #
+        # What the card can say is samples and one hint. VOICE_START is a
+        # format byte that must be 1 (IMA ADPCM, 8 kHz) and a language hint
+        # of at most seven of [A-Za-z0-9_-]. VOICE_CHUNK is an offset and
+        # 1..480 bytes of ADPCM; offsets must be contiguous from 0 and the
+        # whole utterance stays under VOICE_BYTES_MAX (60,000 bytes, 15 s),
+        # per connection, or the connection drops. VOICE_END is a total and
+        # a CRC-32, both checked against what arrived. None of the three
+        # names a file, a path, a program or a destination.
+        #
+        # VOICE_END is what makes a process run, and everything about that
+        # process was fixed before the card connected: which backend (chosen
+        # at server start, voice.choose_backend, and printed), its argv (a
+        # temporary 0600 WAV the server named, and a language code), never a
+        # shell. The language code is the one card value that reaches an
+        # argv or a form field, and voice.voice_lang lets through only two
+        # or three lowercase letters -- anything else is dropped and the
+        # backend auto-detects -- so it cannot be an option, a path or a
+        # word with a meaning to a shell. Bounded in time as well as space:
+        # one transcription per card in flight (a second VOICE_END answers
+        # BUSY), one at a time across cards, every backend under a deadline
+        # that kills its process, and a watchdog that clears busy and
+        # answers NO_STT if anything outlives it.
+        #
+        # Where the audio goes is not the card's to choose either. Local
+        # speech-to-text, or nothing: a cloud service is used only when the
+        # person who started the server opted in (--stt-cloud or
+        # DSTERM_STT_CLOUD=1), never because an API key happens to be set,
+        # never as a fallback when the local one fails, only over https,
+        # and a custom URL is never sent OPENAI_API_KEY.
+        #
+        # VOICE_TEXT carries the transcript back, and with the opt-in that
+        # text came from a third party. It is COMMANDS' and PHOTO_SAVED's
+        # argument once more: printable ASCII (the server folds it,
+        # voice.fold_transcript, and both decoders refuse anything else), at
+        # most 480 bytes, and it lands in the card's composer, where nothing
+        # is sent until the person holding the DS reads it and presses A a
+        # second time. A wrong or hostile transcript can put words in front
+        # of the person, never type them. Its non-OK statuses carry no text.
+        #
+        # MIC_READY is one flag bit (speech-to-text available or not) and
+        # the capability proof: sent right after AUTH_OK only to a card that
+        # announced "mic", and never under --no-mic, so an old server is
+        # never sent a voice type and a card on a server without a backend
+        # is told so before it records. VOICE_ACK is a byte count no larger
+        # than VOICE_BYTES_MAX, the credit the card's upload window slides
+        # on -- a number, display state for the upload.
         allowed = {
             "HELLO", "AUTH", "KEY", "RESYNC", "PING", "VIEW", "SESSION_PICK",
             "NONCE", "AUTH_OK", "AUTH_FAIL",
@@ -533,6 +585,8 @@ class TestNoSideChannels:
             "CAMERA", "CAMERA_FRAME", "PHOTO_CHUNK", "PHOTO_END",
             "PHOTO_DISCARD", "CAMERA_READY", "CAMERA_ACK", "PHOTO_SAVED",
             "SUBSCREEN", "MIRROR", "TOUCH", "ANSWER",
+            "VOICE_START", "VOICE_CHUNK", "VOICE_END",
+            "MIC_READY", "VOICE_ACK", "VOICE_TEXT",
             "ERROR",
         }
         assert {m.name for m in MsgType} == allowed
@@ -647,6 +701,9 @@ class TestEveryServerFrameFitsOneSegment:
             P.MsgType.PHOTO_SAVED: P.encode_photo_saved(0, 65535, "p" * P.PHOTO_PATH_MAX),
             P.MsgType.MIRROR: P.encode_mirror(True),
             P.MsgType.TOUCH: P.encode_touch(255, 191),
+            P.MsgType.MIC_READY: P.encode_mic_ready(True),
+            P.MsgType.VOICE_ACK: P.encode_voice_ack(P.VOICE_BYTES_MAX),
+            P.MsgType.VOICE_TEXT: P.encode_voice_text(0, "t" * P.VOICE_TEXT_MAX),
             P.MsgType.ERROR: P.encode(
                 P.MsgType.ERROR,
                 b"this card's dsterm.nds is older than the computer's: "

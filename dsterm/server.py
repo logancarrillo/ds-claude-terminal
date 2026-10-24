@@ -53,6 +53,8 @@ from .protocol import (
     FEATURE_COMMANDS,
     FEATURE_MIRROR,
     FEATURE_ASK,
+    FEATURE_MIC,
+    FEATURE_PROJECT64,
     MAX_PAYLOAD,
     PRE_AUTH_ALLOWED,
     FrameReader,
@@ -68,6 +70,7 @@ from .protocol import (
     encode,
     encode_cursor,
     encode_camera_ready,
+    encode_mic_ready,
     hello_features,
     hello_card_nonce,
     hello_device_id,
@@ -84,6 +87,7 @@ from .server_sessions import SessionsMixin
 from .server_agents import AgentsMixin
 from .server_feeds import FeedsMixin
 from .server_ext import ExtensionsMixin
+from .server_voice import VoiceMixin
 from .connection import (
     ClientState,
     ExtensionFrame,
@@ -210,7 +214,7 @@ class Counters:
     child_restarts: int = 0
 
 
-class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMixin, AgentsMixin, FeedsMixin, ExtensionsMixin):
+class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMixin, AgentsMixin, FeedsMixin, ExtensionsMixin, VoiceMixin):
     def __init__(
         self,
         command: list[str],
@@ -234,6 +238,10 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         photo_dir: "str | Path | None" = None,
         photo_keep: int = 20,
         camera_popups: bool = True,
+        voice_enabled: bool = True,
+        voice_transcriber: Callable[[bytes, str | None], tuple[int, str]] | None = None,
+        voice_cloud: bool = False,
+        project_ci: bool = False,
     ) -> None:
         self.command = command
         # The command the child runs INSIDE tmux, before serve.py wrapped it:
@@ -245,7 +253,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         self.port = port
         self.interval = 1.0 / fps
         self.cwd = cwd
-        self._init_feeds(cwd, snippets_path, clip_enabled)
+        self._init_feeds(cwd, snippets_path, clip_enabled, project_ci)
         self._init_sessions()
         self._init_agents(remote_enabled, remote_poller)
         # Off unless asked: `dsterm serve` asks (--no-keep-awake declines), and
@@ -289,6 +297,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         self._init_ext()
         self._running = False
         self._init_camera(camera_enabled, photo_dir, photo_keep, camera_popups)
+        self._init_voice(voice_enabled, voice_transcriber, voice_cloud)
         self._init_scrollback()
 
     # -- lifecycle ---------------------------------------------------------
@@ -336,6 +345,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         self._stop_feeds()
         self._stop_agents()
         self._stop_camera()
+        self._stop_voice()
         self._stop_mirror()
         for c in list(self._clients):
             self._drop(c, "server shutting down")
@@ -591,6 +601,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         self._emit(f"client {c.addr} dropped: {why}")
         if c.authed:
             self._camera_card_gone(c)
+            self._voice_card_gone(c)
             self._mirror_card_gone()
             if not any(other.authed for other in self._clients):
                 self._awake.release()
@@ -1006,6 +1017,11 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
             self._on_camera(c, msg)
             return
 
+        if msg.type in (MsgType.VOICE_START, MsgType.VOICE_CHUNK,
+                        MsgType.VOICE_END):
+            self._on_voice(c, msg)
+            return
+
         self._drop(c, f"unexpected message {msg.type.name}")
 
     def _on_hello(self, c: ClientState, msg: Message) -> None:
@@ -1030,6 +1046,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         c.caps.snippets = FEATURE_SNIPPETS in features
         c.caps.tokens = frozenset(features)
         c.caps.project = FEATURE_PROJECT in features
+        c.caps.project64 = FEATURE_PROJECT64 in features
         c.caps.clip = FEATURE_CLIP in features
         # Asked for AND offered: with --no-remote this stays False, so the
         # card is never sent a REMOTE frame and therefore never sends one.
@@ -1041,6 +1058,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         # Asked for AND offered: under --no-camera this stays False, so
         # no READY is sent and any camera frame is a protocol error.
         c.caps.camera = FEATURE_CAMERA in features and self._camera_offered()
+        c.caps.mic = FEATURE_MIC in features and self._voice_offered()
         # Only read at AUTH. A HELLO after that -- sealed, like every
         # frame then -- cannot turn sealing off or on again: the decision
         # was AUTH_OK's, and both counters are already running.
@@ -1162,6 +1180,8 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
             # state the card needs to read first.
             if c.caps.camera:
                 self._send_to(c, encode_camera_ready(self._camera_can_save()))
+            if c.caps.mic:
+                self._send_to(c, encode_mic_ready(self._voice_can_transcribe()))
         else:
             self.counters.auth_failed += 1
             self._send_to(c, encode(MsgType.AUTH_FAIL))
@@ -1274,6 +1294,7 @@ class Server(CameraMixin, PairingMixin, ScrollbackMixin, MirrorMixin, SessionsMi
         # Housekeeping that does not need a card: the camera's worker results
         # and its feed's viewers, scrollback's captures, `dsterm view`.
         self._camera_tick()
+        self._voice_tick()
         self._collect_view_results()
         self._view_tick(live)
 

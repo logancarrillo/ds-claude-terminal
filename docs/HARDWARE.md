@@ -162,6 +162,9 @@ read and edit:
 /dsterm/last                 the computer it connects to at startup
 /dsterm/id                   this console's device id, made once
 /dsterm/sounds/              your own sounds, if any (CUSTOMIZING.md)
+/dsterm/lang/                your own interface languages, *.lang, up to two (CUSTOMIZING.md)
+/dsterm/quick.txt            the quick commands you saved with QUICK → COMMANDS → + ADD
+/dsterm/recent.txt           your last ten prompts, for QUICK's AGAIN
 /dsterm/backups/             earlier versions of the app, kept by `dsterm card`
 /dsterm-settings.cfg         the Settings page's choices
 /dsterm.snippets             optional canned prompts (CUSTOMIZING.md)

@@ -3,7 +3,9 @@
 #include <nds.h>
 
 #include "font.h"
+#include "lang.h"
 #include "privacy.h"
+#include "ui_font.h"
 
 #define SCREEN_W 256
 #define SCREEN_H 192
@@ -281,6 +283,55 @@ void render_overlay_grid(const grid_t *g)
     }
 }
 
+// A boxed note over whatever overlay is up: the controls guide's pop-up
+// (guide.h places it, clear of the still session's input line).  A box with
+// an accent border, drawn in the UI font rather than the terminal's so every
+// language's text fits it, and drawn once -- it is not terminal text, so it
+// cannot scroll away or be overwritten by a diff (overlay_active is already
+// set by the overlay underneath).
+void render_overlay_box(int x, int y, int w, int h, const char *const *lines,
+                        const uint16_t *colours, int count, int pitch)
+{
+    if (x < 0 || y < 0 || w < 8 || h < 8 ||
+        x + w > SCREEN_W || y + h > SCREEN_H) return;
+    const u16 border = palette[PAL_ORANGE];
+    const u16 fill = ARGB16(1, 2, 2, 4);
+    for (int yy = y; yy < y + h; yy++) {
+        for (int xx = x; xx < x + w; xx++) {
+            const int edge = yy < y + 2 || yy >= y + h - 2 ||
+                             xx < x + 2 || xx >= x + w - 2;
+            fb[yy * SCREEN_W + xx] = edge ? border : fill;
+        }
+    }
+    const int pad = 6;
+    const int right = x + w - pad;
+    for (int i = 0; i < count && lines; i++) {
+        const char *p = lines[i] ? privacy_text(lines[i]) : "";
+        // The CJK atlas's glyphs reach one row above the line: start a row
+        // lower so the first line clears the border.
+        const int py = y + pad + 1 + i * pitch;
+        if (py + 9 > y + h - 2) break;
+        const u16 fg = colours ? colours[i] : palette[PAL_DEFAULT];
+        int px = x + pad;
+        while (*p) {
+            const uint8_t b0 = (uint8_t)*p;
+            if (b0 < 0xC0) {   // ASCII, or a raw wire glyph
+                if (px + 6 > right) break;
+                render_glyph_into(fb, SCREEN_W, px, py, b0, fg, fill);
+                p++;
+                px += 6;
+                continue;
+            }
+            const char *q = p;
+            const uint32_t cp = lang_utf8_next(&q);
+            const int wide = lang_cp_is_wide(cp) ? 12 : 6;
+            if (px + wide > right) break;
+            px += render_unicode_into(fb, SCREEN_W, px, py, cp, fg, fill);
+            p = q;
+        }
+    }
+}
+
 void render_overlay_close(const grid_t *g)
 {
     overlay_active = 0;
@@ -311,6 +362,57 @@ void render_glyph_into(uint16_t *target, int stride, int px, int py,
             line[x] = (bits & (1 << (FONT_W - 1 - x))) ? fgc : bgc;
         }
     }
+}
+
+int render_unicode_into(uint16_t *target, int stride, int px, int py,
+                        uint32_t cp, uint16_t fgc, uint16_t bgc)
+{
+    if (cp <= 0x7E) {
+        render_glyph_into(target, stride, px, py, (uint8_t)cp, fgc, bgc);
+        return FONT_W;
+    }
+    // Accented Latin letters from the terminal font's own letter plus a mark
+    // (lang.h): the atlas's versions of these are too heavy to tell apart.
+    uint8_t latin[FONT_H];
+    if (lang_latin_glyph(cp, font6x8, latin)) {
+        if (px < 0 || py < 0 || px + FONT_W > stride || py + FONT_H > 256) {
+            return FONT_W;
+        }
+        for (int y = 0; y < FONT_H; y++) {
+            uint16_t *line = target + (py + y) * stride + px;
+            for (int x = 0; x < FONT_W; x++) {
+                line[x] = (latin[y] & (1 << (FONT_W - 1 - x))) ? fgc : bgc;
+            }
+        }
+        return FONT_W;
+    }
+    const ui_glyph_t *g = ui_font_lookup(cp);
+    if (!g) {
+        render_glyph_into(target, stride, px, py, (uint8_t)'?', fgc, bgc);
+        return FONT_W;
+    }
+    const int w = (int)g->width;
+    if (px < 0 || py < 0 || px + w > stride || py + FONT_H > 256) return w;
+    // A CJK glyph is 10 rows (Fusion Pixel 10px) on an 8-row text line.
+    // Drawing only the line's 8 cut the top and bottom off every character
+    // -- legible in the font, unreadable on the DS. It is centred on the
+    // line instead: one row above, one below, and those two rows paint the
+    // glyph's own pixels only, never background, so a neighbouring line
+    // drawn before or after this one keeps everything it drew.
+    const int h = (int)g->height < UI_FONT_H ? (int)g->height : UI_FONT_H;
+    const int y0 = py - (h - FONT_H) / 2;
+    for (int y = 0; y < h; y++) {
+        const int sy = y0 + y;
+        if (sy < 0 || sy >= 256) continue;
+        const int inside = sy >= py && sy < py + FONT_H;
+        uint16_t *line = target + sy * stride + px;
+        const uint16_t bits = g->rows[y];
+        for (int x = 0; x < w; x++) {
+            if (bits & (1u << (w - 1 - x))) line[x] = fgc;
+            else if (inside)                 line[x] = bgc;
+        }
+    }
+    return w;
 }
 
 // The terminal's own glyph loop at the grid cell size, using the geometry's

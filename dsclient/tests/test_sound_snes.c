@@ -412,8 +412,11 @@ static void test_settings_sound_rows(void)
               back.volume == SETTINGS_VOLUME_MID && back.blips == SETTINGS_WRITING_MID &&
               back.boot == SETTINGS_BOOT_KEYS,
           "a version 2 file did not load with sound defaults: %s", err);
-    CHECK(!settings_parse("version=3\nsound=loud\n", &back, err, sizeof(err)),
-          "an unknown sound value was accepted");
+    // An unknown value costs that one setting, never the file (rule 3).
+    CHECK(settings_parse("version=3\nsound=loud\nvolume=high\n", &back, err,
+                         sizeof(err)) &&
+              back.sound == SETTINGS_SOUND_CHIP && back.volume == SETTINGS_VOLUME_HIGH,
+          "an unknown sound value was not its default alone: %s", err);
 
     // Every row still finishes above the strip an extension stands on.
     int x, y, w, h;

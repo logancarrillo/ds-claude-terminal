@@ -20,6 +20,7 @@
 
 #include "../source/config.h"
 #include "../source/discover.h"
+#include "../source/lang.h"
 #include "../source/profiles.h"
 #include "../source/proto.h"
 #include "../source/quick.h"
@@ -179,7 +180,7 @@ static void fuzz_list_decoders(void)
         uint8_t x, y, kind;
         int flag;
         proto_result_t r = PROTO_OK;
-        switch (fz_below(13)) {
+        switch (fz_below(16)) {
         case 0: r = proto_apply_remote(&rc, payload, len); break;
         case 1:
             r = proto_apply_remote_note(a, sizeof(a), payload, len);
@@ -216,6 +217,14 @@ static void fuzz_list_decoders(void)
             r = proto_decode_photo_saved(&ps, payload, len);
             if (r == PROTO_OK) bad += !ends_inside(ps.path, sizeof(ps.path));
             break;
+        case 12: r = proto_decode_mic_ready(&flag, payload, len); break;
+        case 13: r = proto_decode_voice_ack(&u32, payload, len); break;
+        case 14: {
+            static voice_text_t vt;
+            r = proto_decode_voice_text(&vt, payload, len);
+            if (r == PROTO_OK) bad += !ends_inside(vt.text, sizeof(vt.text));
+            break;
+        }
         default: {
             static quick_commands_t qc;
             quick_commands_init(&qc);
@@ -304,12 +313,17 @@ static void fuzz_card_files(void)
         if (!exact) abort();
         memcpy(exact, text, n);
         memset(err, 'Z', sizeof(err));
-        switch (fz_below(6)) {
+        switch (fz_below(7)) {
         case 0: (void)config_parse(exact, &cfg, err, sizeof(err)); break;
         case 1: (void)snippets_parse(exact, &sn, err, sizeof(err)); break;
         case 2: (void)wifi_profile_parse(exact, &w, err, sizeof(err)); break;
         case 3: (void)server_profile_parse(exact, &sp, err, sizeof(err)); break;
         case 4: (void)settings_parse(exact, &st, err, sizeof(err)); break;
+        case 5:
+            lang_init();
+            (void)lang_load_text(exact, "fz", err, sizeof(err));
+            lang_init();
+            break;
         default:
             quick_recent_parse(&recent, exact);
             bad += recent.count > QUICK_RECENT_MAX;
